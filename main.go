@@ -5,59 +5,8 @@ import (
 	"os"
 	"os/exec"
 
-	"bufio"
-	"path/filepath"
-	"strings"
-
 	tea "github.com/charmbracelet/bubbletea"
 )
-
-func findMakefiles() ([]string, error) {
-	var makefiles []string
-	err := filepath.Walk(".", func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-		if !info.IsDir() && info.Name() == "Makefile" {
-			makefiles = append(makefiles, path)
-		}
-		return nil
-	})
-	if err != nil {
-		return nil, err
-	}
-	return makefiles, nil
-}
-
-func parseMakefileTargets(makefilePath string) ([]string, error) {
-	file, err := os.Open(makefilePath)
-	if err != nil {
-		return nil, err
-	}
-	defer file.Close()
-
-	var targets []string
-	scanner := bufio.NewScanner(file)
-	for scanner.Scan() {
-		line := scanner.Text()
-		// Ignore comments, empty lines, and .PHONY declarations
-		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") || strings.HasPrefix(strings.TrimSpace(line), ".PHONY") {
-			continue
-		}
-		// Check if the line contains a target
-		if strings.Contains(line, ":") && !strings.HasPrefix(line, "\t") {
-			parts := strings.SplitN(line, ":", 2)
-			target := strings.TrimSpace(parts[0])
-			if target != "" {
-				targets = append(targets, target)
-			}
-		}
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, err
-	}
-	return targets, nil
-}
 
 type model struct {
 	choices  []string
@@ -78,10 +27,14 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "up":
 			if m.cursor > 0 {
 				m.cursor--
+			} else {
+				m.cursor = len(m.choices) - 1
 			}
 		case "down":
 			if m.cursor < len(m.choices)-1 {
 				m.cursor++
+			} else {
+				m.cursor = 0
 			}
 		case "enter":
 			m.selected = true
@@ -93,18 +46,23 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) View() string {
 	if m.selected {
-		return fmt.Sprintf("You selected: %s\n", m.choices[m.cursor])
+		return fmt.Sprintf("Making: \033[32m%s\033[0m\n", m.choices[m.cursor])
 	}
 
-	s := "Choose a Makefile target:\n\n"
+	s := "\033[33mMake:\033[0m\n\n"
 	for i, choice := range m.choices {
 		cursor := " "
 		if m.cursor == i {
 			cursor = ">"
 		}
-		s += fmt.Sprintf("%s %s\n", cursor, choice)
+		choiceText := choice
+		if m.cursor == i {
+			s += fmt.Sprintf("%s \033[32m%s\033[0m\n", cursor, choiceText)
+		} else {
+			s += fmt.Sprintf("%s %s\n", cursor, choiceText)
+		}
 	}
-	s += "\nPress q to quit.\n"
+	s += "\nPress \033[31mq\033[0m to quit.\n"
 	return s
 }
 
