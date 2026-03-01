@@ -8,8 +8,11 @@ import (
 )
 
 type MakeTarget struct {
-	Name string
-	Dir  string
+	Name         string
+	Dir          string
+	Description  string
+	Dependencies []string
+	Recipe       []string
 }
 
 type TargetGroup struct {
@@ -58,23 +61,71 @@ func parseMakefileTargets(makefilePath string) ([]MakeTarget, error) {
 	dir := filepath.Dir(makefilePath)
 
 	var targets []MakeTarget
+	var commentBuf []string
+	var current *MakeTarget
+
 	scanner := bufio.NewScanner(file)
 	for scanner.Scan() {
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") || strings.HasPrefix(trimmed, ".PHONY") {
-			continue
-		}
-		if strings.Contains(line, ":") && !strings.HasPrefix(line, "\t") {
-			parts := strings.SplitN(line, ":", 2)
-			name := strings.TrimSpace(parts[0])
-			if name == "" {
+
+		// Collect recipe lines for current target
+		if current != nil {
+			if strings.HasPrefix(line, "\t") {
+				current.Recipe = append(current.Recipe, strings.TrimPrefix(line, "\t"))
 				continue
 			}
+			current = nil
+		}
+
+		if trimmed == "" {
+			commentBuf = nil
+			continue
+		}
+
+		// .PHONY does NOT clear comment buffer (comment → .PHONY → target is common)
+		if strings.HasPrefix(trimmed, ".PHONY") {
+			continue
+		}
+
+		if strings.HasPrefix(trimmed, "#") {
+			comment := strings.TrimSpace(strings.TrimPrefix(trimmed, "#"))
+			commentBuf = append(commentBuf, comment)
+			continue
+		}
+
+		colonIdx := strings.Index(line, ":")
+		equalIdx := strings.Index(line, "=")
+		isVarAssign := equalIdx >= 0 && (equalIdx < colonIdx || colonIdx+1 == equalIdx)
+		if colonIdx >= 0 && !strings.HasPrefix(line, "\t") && !isVarAssign {
+			parts := strings.SplitN(line, ":", 2)
+			name := strings.TrimSpace(parts[0])
+			if name == "" || strings.Contains(name, "%") {
+				commentBuf = nil
+				continue
+			}
+
+			var deps []string
+			if len(parts) > 1 {
+				for _, d := range strings.Fields(parts[1]) {
+					if d != "" && d != ";" {
+						deps = append(deps, d)
+					}
+				}
+			}
+
+			desc := strings.Join(commentBuf, " ")
+			commentBuf = nil
+
 			targets = append(targets, MakeTarget{
-				Name: name,
-				Dir:  dir,
+				Name:         name,
+				Dir:          dir,
+				Description:  desc,
+				Dependencies: deps,
 			})
+			current = &targets[len(targets)-1]
+		} else {
+			commentBuf = nil
 		}
 	}
 	if err := scanner.Err(); err != nil {

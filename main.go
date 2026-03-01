@@ -7,15 +7,19 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	termenv "github.com/muesli/termenv"
 )
 
 var (
-	accent     = lipgloss.Color("#d08770")
-	dimColor   = lipgloss.Color("#4c566a")
-	faintColor = lipgloss.Color("#2e3440")
-	textColor  = lipgloss.Color("#7a8490")
-	hiColor    = lipgloss.Color("#d8dee9")
-	cyanColor  = lipgloss.Color("#5e81ac")
+	accent      = lipgloss.Color("#d08770")
+	dimColor    = lipgloss.Color("#4c566a")
+	subtleColor = lipgloss.Color("#3b4252")
+	textColor   = lipgloss.Color("#7a8490")
+	hiColor     = lipgloss.Color("#d8dee9")
+	cyanColor   = lipgloss.Color("#5e81ac")
+	greenColor  = lipgloss.Color("#a3be8c")
+	purpleColor = lipgloss.Color("#b48ead")
+	yellowColor = lipgloss.Color("#ebcb8b")
 
 	titleStyle = lipgloss.NewStyle().
 			Foreground(accent).
@@ -48,25 +52,46 @@ var (
 	helpKeyStyle = lipgloss.NewStyle().
 			Foreground(dimColor)
 
-	barStyle = lipgloss.NewStyle().
-			Foreground(faintColor)
+	borderStyle = lipgloss.NewStyle().
+			Foreground(dimColor)
 
-	makingStyle = lipgloss.NewStyle().
-			Foreground(accent).
+	previewBorderStyle = lipgloss.NewStyle().
+				Foreground(subtleColor)
+
+	descStyle = lipgloss.NewStyle().
+			Foreground(yellowColor).
+			Italic(true)
+
+	depsLabelStyle = lipgloss.NewStyle().
+			Foreground(purpleColor).
 			Bold(true)
+
+	depsValueStyle = lipgloss.NewStyle().
+			Foreground(textColor)
+
+	recipeStyle = lipgloss.NewStyle().
+			Foreground(greenColor)
 
 	noMatchStyle = lipgloss.NewStyle().
 			Foreground(dimColor).
 			Italic(true)
+
+	previewLabelStyle = lipgloss.NewStyle().
+				Foreground(subtleColor)
+
+	previewNameStyle = lipgloss.NewStyle().
+				Foreground(hiColor).
+				Bold(true)
 )
 
 type model struct {
 	groups   []TargetGroup
 	flat     []MakeTarget
-	filtered []int // indices into flat
-	cursor   int   // index into filtered
+	filtered []int
+	cursor   int
 	selected bool
 	width    int
+	height   int
 	filter   string
 }
 
@@ -79,10 +104,9 @@ func newModel(groups []TargetGroup) model {
 	for i := range flat {
 		filtered[i] = i
 	}
-	return model{groups: groups, flat: flat, filtered: filtered, width: 80}
+	return model{groups: groups, flat: flat, filtered: filtered, width: 80, height: 24}
 }
 
-// fuzzyMatch returns true if all characters in pattern appear in s in order (case-insensitive).
 func fuzzyMatch(s, pattern string) bool {
 	s = strings.ToLower(s)
 	pattern = strings.ToLower(pattern)
@@ -95,7 +119,6 @@ func fuzzyMatch(s, pattern string) bool {
 	return pi == len(pattern)
 }
 
-// fuzzyHighlight renders s with matched characters highlighted.
 func fuzzyHighlight(s, pattern string, base, highlight lipgloss.Style) string {
 	if pattern == "" {
 		return base.Render(s)
@@ -158,6 +181,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
+		m.height = msg.Height
 	case tea.KeyMsg:
 		switch msg.String() {
 		case "esc", "ctrl+c":
@@ -189,7 +213,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.updateFilter()
 			}
 		default:
-			// Single printable character -> append to filter
 			r := msg.String()
 			if len(r) == 1 && r[0] >= 32 && r[0] < 127 {
 				m.filter += r
@@ -200,78 +223,57 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) View() string {
-	if m.selected {
-		target := m.flat[m.filtered[m.cursor]]
-		label := target.Name
-		if target.Dir != "." {
-			label = target.Dir + "/" + target.Name
-		}
-		return makingStyle.Render("▸ "+label) + "\n"
-	}
-
-	w := m.width
-
-	// Top bar: ── mkm ────────────── or ── mkm / filter ──────
-	var topTag string
-	var topTagLen int
-	if m.filter == "" {
-		topTag = titleStyle.Render(" mkm ")
-		topTagLen = 5
-	} else {
-		topTag = titleStyle.Render(" mkm ") +
-			filterPromptStyle.Render("/") +
-			filterStyle.Render(m.filter) + " "
-		topTagLen = 5 + 1 + len(m.filter) + 1
-	}
-	leftBar := barStyle.Render("──")
-	rightBar := barStyle.Render(strings.Repeat("─", max(0, w-topTagLen-4)))
-	topBar := leftBar + topTag + rightBar
-
+// renderTargetList renders the left pane: grouped targets with fuzzy highlighting and scrolling.
+func (m model) renderTargetList(w, h int) string {
 	var lines []string
-	lines = append(lines, topBar)
+	cursorLine := 0
 
 	if len(m.filtered) == 0 {
-		lines = append(lines, noMatchStyle.Render("    no matches"))
+		lines = append(lines, noMatchStyle.Render("no matches"))
 	} else {
-		// Build a set of which flat indices are visible
 		visibleSet := map[int]bool{}
 		for _, fi := range m.filtered {
 			visibleSet[fi] = true
 		}
 
-		// Render grouped, but only show visible items
 		filteredIdx := 0
 		flatIdx := 0
-		for _, g := range m.groups {
-			// Check if this group has any visible items
+		for gi, g := range m.groups {
 			hasVisible := false
-			for _, t := range g.Targets {
-				_ = t
+			for range g.Targets {
 				if visibleSet[flatIdx] {
 					hasVisible = true
 				}
 				flatIdx++
 			}
-			flatIdx -= len(g.Targets) // reset for actual render
+			flatIdx -= len(g.Targets)
 
 			if !hasVisible {
 				flatIdx += len(g.Targets)
 				continue
 			}
 
-			if g.Dir != "." {
-				lines = append(lines, groupHeaderStyle.Render("  "+g.Dir+"/"))
+			// Add spacing between groups (not before the first)
+			if len(lines) > 0 {
+				lines = append(lines, "")
 			}
+
+			if g.Dir != "." {
+				lines = append(lines, groupHeaderStyle.Render(g.Dir+"/"))
+			} else if gi == 0 {
+				// Don't label the root group at all if it's first
+			}
+
 			for _, t := range g.Targets {
 				if visibleSet[flatIdx] {
 					label := t.Name
 					if filteredIdx == m.cursor {
-						hl := fuzzyHighlight(label, m.filter, selectedItemStyle, makingStyle)
-						lines = append(lines, selectedCursorStyle.Render("  > ")+hl)
+						cursorLine = len(lines)
+						hl := fuzzyHighlight(label, m.filter, selectedItemStyle, selectedCursorStyle)
+						lines = append(lines, selectedCursorStyle.Render(" > ")+hl)
 					} else {
 						hl := fuzzyHighlight(label, m.filter, normalItemStyle, matchStyle)
-						lines = append(lines, "    "+hl)
+						lines = append(lines, "   "+hl)
 					}
 					filteredIdx++
 				}
@@ -280,21 +282,260 @@ func (m model) View() string {
 		}
 	}
 
-	// Bottom bar
-	var help string
-	if m.filter == "" {
-		help = helpKeyStyle.Render(" ↑↓ enter type to filter ")
-	} else {
-		help = helpKeyStyle.Render(" ↑↓ enter bksp clear ")
+	// Scroll: pick a window of h lines around the cursor
+	if len(lines) > h {
+		offset := cursorLine - h/3
+		if offset < 0 {
+			offset = 0
+		}
+		if offset > len(lines)-h {
+			offset = len(lines) - h
+		}
+		lines = lines[offset : offset+h]
 	}
-	helpLen := lipgloss.Width(help)
-	leftHelp := barStyle.Render("──")
-	rightHelp := barStyle.Render(strings.Repeat("─", max(0, w-helpLen-4)))
-	bottomBar := leftHelp + help + rightHelp
 
-	lines = append(lines, bottomBar)
+	// Pad to fill height
+	for len(lines) < h {
+		lines = append(lines, "")
+	}
 
-	return strings.Join(lines, "\n") + "\n"
+	// Truncate each line to width
+	for i, line := range lines {
+		lw := lipgloss.Width(line)
+		if lw < w {
+			lines[i] = line + strings.Repeat(" ", w-lw)
+		}
+	}
+
+	return strings.Join(lines, "\n")
+}
+
+// renderPreview renders the right pane: info about the highlighted target.
+func (m model) renderPreview(w, h int) string {
+	border := lipgloss.RoundedBorder()
+	bs := previewBorderStyle
+
+	// Inner dimensions (subtract border + 1 char padding each side)
+	innerW := w - 4
+	innerH := h - 2
+	if innerW < 5 || innerH < 3 {
+		return ""
+	}
+
+	var contentLines []string
+
+	if len(m.filtered) > 0 {
+		target := m.flat[m.filtered[m.cursor]]
+
+		// Target name
+		fullName := target.Name
+		if target.Dir != "." {
+			fullName = target.Dir + "/" + target.Name
+		}
+		contentLines = append(contentLines, previewNameStyle.Render(fullName))
+		contentLines = append(contentLines, "")
+
+		// Description
+		if target.Description != "" {
+			wrapped := wordWrap(target.Description, innerW)
+			for _, wl := range strings.Split(wrapped, "\n") {
+				contentLines = append(contentLines, descStyle.Render(wl))
+			}
+			contentLines = append(contentLines, "")
+		}
+
+		// Dependencies
+		if len(target.Dependencies) > 0 {
+			depsStr := strings.Join(target.Dependencies, ", ")
+			contentLines = append(contentLines, depsLabelStyle.Render("deps ")+depsValueStyle.Render(depsStr))
+			contentLines = append(contentLines, "")
+		}
+
+		// Recipe
+		if len(target.Recipe) > 0 {
+			for _, rl := range target.Recipe {
+				if lipgloss.Width(rl) > innerW {
+					rl = rl[:innerW-1] + "…"
+				}
+				contentLines = append(contentLines, recipeStyle.Render(rl))
+			}
+		} else {
+			contentLines = append(contentLines, noMatchStyle.Render("(no recipe)"))
+		}
+	}
+
+	// Trim to available height
+	if len(contentLines) > innerH {
+		contentLines = contentLines[:innerH]
+	}
+
+	// Pad to fill inner height
+	for len(contentLines) < innerH {
+		contentLines = append(contentLines, "")
+	}
+
+	// Pad each line to inner width
+	for i, line := range contentLines {
+		lw := lipgloss.Width(line)
+		if lw < innerW {
+			contentLines[i] = line + strings.Repeat(" ", innerW-lw)
+		}
+	}
+
+	// Build the bordered preview box manually
+	label := " preview "
+	topFill := innerW + 2 - lipgloss.Width(label) - 1 // +2 for padding, -1 for left dash
+	if topFill < 0 {
+		topFill = 0
+	}
+	top := bs.Render(border.TopLeft+"─") +
+		previewLabelStyle.Render(label) +
+		bs.Render(strings.Repeat("─", topFill)+border.TopRight)
+
+	bottom := bs.Render(border.BottomLeft + strings.Repeat("─", innerW+2) + border.BottomRight)
+
+	var rows []string
+	rows = append(rows, top)
+	for _, cl := range contentLines {
+		rows = append(rows, bs.Render(border.Left)+" "+cl+" "+bs.Render(border.Right))
+	}
+	rows = append(rows, bottom)
+
+	return strings.Join(rows, "\n")
+}
+
+// renderPanel constructs the outer bordered panel with title in top border and help in bottom.
+func (m model) renderPanel(body string, panelW int) string {
+	border := lipgloss.RoundedBorder()
+	bs := borderStyle
+
+	innerW := panelW - 2 // subtract left + right border chars
+
+	// Top border with title
+	var titleTag string
+	var titleLen int
+	if m.filter == "" {
+		titleTag = bs.Render("[ ") + titleStyle.Render("mkm") + bs.Render(" ]")
+		titleLen = 7 // "[ mkm ]"
+	} else {
+		titleTag = bs.Render("[ ") + titleStyle.Render("mkm") + " " +
+			filterPromptStyle.Render("/") +
+			filterStyle.Render(m.filter) + bs.Render(" ]")
+		titleLen = 7 + 1 + len(m.filter) // "[ mkm /filter ]"
+	}
+	topFill := innerW - titleLen - 2 // 2 for leading "──"
+	if topFill < 0 {
+		topFill = 0
+	}
+	top := bs.Render(border.TopLeft+"──") + titleTag + bs.Render(strings.Repeat("─", topFill)+border.TopRight)
+
+	// Bottom border with help
+	var helpText string
+	if m.filter == "" {
+		helpText = helpKeyStyle.Render("type to filter") + bs.Render("  ") +
+			helpKeyStyle.Render("↑↓") + bs.Render("  ") +
+			helpKeyStyle.Render("enter") + bs.Render("  ") +
+			helpKeyStyle.Render("esc")
+	} else {
+		helpText = helpKeyStyle.Render("/"+m.filter) + bs.Render("  ") +
+			helpKeyStyle.Render("↑↓") + bs.Render("  ") +
+			helpKeyStyle.Render("enter") + bs.Render("  ") +
+			helpKeyStyle.Render("bksp") + bs.Render("  ") +
+			helpKeyStyle.Render("esc")
+	}
+	helpLen := lipgloss.Width(helpText)
+	botFill := innerW - helpLen - 4 // 4 for "[ " and " ]"
+	if botFill < 0 {
+		botFill = 0
+	}
+	bottom := bs.Render(border.BottomLeft+strings.Repeat("─", botFill)) +
+		bs.Render("[ ") + helpText + bs.Render(" ]") +
+		bs.Render(border.BottomRight)
+
+	// Body rows with side borders and padding
+	bodyLines := strings.Split(body, "\n")
+	var rows []string
+	rows = append(rows, top)
+	// Top padding row
+	rows = append(rows, bs.Render(border.Left)+strings.Repeat(" ", innerW)+bs.Render(border.Right))
+	for _, bl := range bodyLines {
+		lw := lipgloss.Width(bl)
+		pad := innerW - 2 - lw // 2 for left padding
+		if pad < 0 {
+			pad = 0
+		}
+		rows = append(rows, bs.Render(border.Left)+"  "+bl+strings.Repeat(" ", pad)+bs.Render(border.Right))
+	}
+	// Bottom padding row
+	rows = append(rows, bs.Render(border.Left)+strings.Repeat(" ", innerW)+bs.Render(border.Right))
+	rows = append(rows, bottom)
+
+	return strings.Join(rows, "\n")
+}
+
+func (m model) View() string {
+	if m.selected {
+		return ""
+	}
+
+	// Calculate panel dimensions
+	panelW := int(float64(m.width) * 0.65)
+	panelH := int(float64(m.height) * 0.70)
+	panelW = clamp(panelW, 50, m.width-4)
+	panelH = clamp(panelH, 15, m.height-2)
+
+	// Inner area (subtract border, padding rows)
+	innerW := panelW - 2 - 4 // border(2) + left padding indent(4)
+	innerH := panelH - 4     // border(2) + padding rows(2)
+	if innerW < 20 {
+		innerW = 20
+	}
+	if innerH < 5 {
+		innerH = 5
+	}
+
+	// Split into left list and right preview
+	leftW := int(float64(innerW) * 0.50)
+	rightW := innerW - leftW - 2 // 2 char gap
+
+	leftContent := m.renderTargetList(leftW, innerH)
+	rightContent := m.renderPreview(rightW, innerH)
+
+	// Join horizontally with gap
+	body := lipgloss.JoinHorizontal(lipgloss.Top, leftContent, "  ", rightContent)
+
+	panel := m.renderPanel(body, panelW)
+
+	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+}
+
+func wordWrap(s string, width int) string {
+	words := strings.Fields(s)
+	if len(words) == 0 {
+		return ""
+	}
+	var lines []string
+	current := words[0]
+	for _, word := range words[1:] {
+		if len(current)+1+len(word) > width {
+			lines = append(lines, current)
+			current = word
+		} else {
+			current += " " + word
+		}
+	}
+	lines = append(lines, current)
+	return strings.Join(lines, "\n")
+}
+
+func clamp(v, lo, hi int) int {
+	if v < lo {
+		return lo
+	}
+	if v > hi {
+		return hi
+	}
+	return v
 }
 
 func makeCmd(target MakeTarget) []string {
@@ -332,7 +573,22 @@ func main() {
 	}
 
 	groups := groupTargets(allTargets)
-	p := tea.NewProgram(newModel(groups), tea.WithOutput(os.Stderr))
+
+	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "Error opening TTY:", err)
+		os.Exit(1)
+	}
+	defer tty.Close()
+
+	lipgloss.DefaultRenderer().SetColorProfile(termenv.TrueColor)
+
+	p := tea.NewProgram(
+		newModel(groups),
+		tea.WithInput(tty),
+		tea.WithOutput(tty),
+		tea.WithAltScreen(),
+	)
 
 	m, err := p.Run()
 	if err != nil {

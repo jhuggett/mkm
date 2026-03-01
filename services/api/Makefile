@@ -1,10 +1,14 @@
-.PHONY: build test deploy
-
+# Compile the API server binary
+.PHONY: build
 build:
 	@echo "Building API service..."
 
-test:
+# Run the test suite with coverage
+.PHONY: test
+test: build
 	@echo "Running API tests..."
 
-deploy:
+# Deploy the API to production
+.PHONY: deploy
+deploy: build test
 	@echo "Deploying API service..."
