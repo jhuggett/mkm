@@ -105,16 +105,35 @@ func parseMakefileTargets(makefilePath string) ([]MakeTarget, error) {
 				continue
 			}
 
-			var deps []string
+			// Make treats any `#` on a rule line as start-of-comment. Strip
+			// everything from the first `#` onward; if it starts `##`, treat
+			// the trailing text as an inline self-documenting description
+			// (the `target: deps ## desc` convention tools like mkm surface).
+			depsPart := ""
+			var inlineDesc string
 			if len(parts) > 1 {
-				for _, d := range strings.Fields(parts[1]) {
-					if d != "" && d != ";" {
-						deps = append(deps, d)
+				depsPart = parts[1]
+				if hashIdx := strings.Index(depsPart, "#"); hashIdx >= 0 {
+					if hashIdx+1 < len(depsPart) && depsPart[hashIdx+1] == '#' {
+						inlineDesc = strings.TrimSpace(depsPart[hashIdx+2:])
 					}
+					depsPart = depsPart[:hashIdx]
 				}
 			}
 
-			desc := strings.Join(commentBuf, " ")
+			var deps []string
+			for _, d := range strings.Fields(depsPart) {
+				if d != "" && d != ";" {
+					deps = append(deps, d)
+				}
+			}
+
+			// Inline `##` description wins over preceding `#` comments; it's
+			// attached directly to the target, so more intentional.
+			desc := inlineDesc
+			if desc == "" {
+				desc = strings.Join(commentBuf, " ")
+			}
 			commentBuf = nil
 
 			targets = append(targets, MakeTarget{

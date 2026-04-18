@@ -52,11 +52,8 @@ var (
 	helpKeyStyle = lipgloss.NewStyle().
 			Foreground(dimColor)
 
-	borderStyle = lipgloss.NewStyle().
-			Foreground(dimColor)
-
-	previewBorderStyle = lipgloss.NewStyle().
-				Foreground(subtleColor)
+	ruleStyle = lipgloss.NewStyle().
+			Foreground(subtleColor)
 
 	descStyle = lipgloss.NewStyle().
 			Foreground(yellowColor).
@@ -76,23 +73,21 @@ var (
 			Foreground(dimColor).
 			Italic(true)
 
-	previewLabelStyle = lipgloss.NewStyle().
-				Foreground(subtleColor)
-
 	previewNameStyle = lipgloss.NewStyle().
 				Foreground(hiColor).
 				Bold(true)
 )
 
 type model struct {
-	groups   []TargetGroup
-	flat     []MakeTarget
-	filtered []int
-	cursor   int
-	selected bool
-	width    int
-	height   int
-	filter   string
+	groups      []TargetGroup
+	flat        []MakeTarget
+	filtered    []int
+	cursor      int
+	selected    bool
+	width       int
+	height      int
+	filter      string
+	showPreview bool
 }
 
 func newModel(groups []TargetGroup) model {
@@ -104,7 +99,14 @@ func newModel(groups []TargetGroup) model {
 	for i := range flat {
 		filtered[i] = i
 	}
-	return model{groups: groups, flat: flat, filtered: filtered, width: 80, height: 24}
+	return model{
+		groups:      groups,
+		flat:        flat,
+		filtered:    filtered,
+		width:       80,
+		height:      24,
+		showPreview: true,
+	}
 }
 
 func fuzzyMatch(s, pattern string) bool {
@@ -186,6 +188,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		switch msg.String() {
 		case "esc", "ctrl+c":
 			return m, tea.Quit
+		case "tab":
+			m.showPreview = !m.showPreview
 		case "up", "ctrl+p":
 			if len(m.filtered) > 0 {
 				if m.cursor > 0 {
@@ -223,13 +227,27 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-// renderTargetList renders the left pane: grouped targets with fuzzy highlighting and scrolling.
+// truncateStr truncates s to fit within width visible characters, adding … if truncated.
+func truncateStr(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	if len(s) <= width {
+		return s
+	}
+	if width <= 1 {
+		return "…"
+	}
+	return s[:width-1] + "…"
+}
+
+// renderTargetList renders the grouped target list filling w x h exactly.
 func (m model) renderTargetList(w, h int) string {
 	var lines []string
 	cursorLine := 0
 
 	if len(m.filtered) == 0 {
-		lines = append(lines, noMatchStyle.Render("no matches"))
+		lines = append(lines, noMatchStyle.Render(truncateStr("no matches", w)))
 	} else {
 		visibleSet := map[int]bool{}
 		for _, fi := range m.filtered {
@@ -253,20 +271,23 @@ func (m model) renderTargetList(w, h int) string {
 				continue
 			}
 
-			// Add spacing between groups (not before the first)
 			if len(lines) > 0 {
 				lines = append(lines, "")
 			}
 
 			if g.Dir != "." {
-				lines = append(lines, groupHeaderStyle.Render(g.Dir+"/"))
+				lines = append(lines, groupHeaderStyle.Render(truncateStr(g.Dir+"/", w)))
 			} else if gi == 0 {
 				// Don't label the root group at all if it's first
 			}
 
+			labelW := w - 3
+			if labelW < 1 {
+				labelW = 1
+			}
 			for _, t := range g.Targets {
 				if visibleSet[flatIdx] {
-					label := t.Name
+					label := truncateStr(t.Name, labelW)
 					if filteredIdx == m.cursor {
 						cursorLine = len(lines)
 						hl := fuzzyHighlight(label, m.filter, selectedItemStyle, selectedCursorStyle)
@@ -282,7 +303,6 @@ func (m model) renderTargetList(w, h int) string {
 		}
 	}
 
-	// Scroll: pick a window of h lines around the cursor
 	if len(lines) > h {
 		offset := cursorLine - h/3
 		if offset < 0 {
@@ -294,12 +314,10 @@ func (m model) renderTargetList(w, h int) string {
 		lines = lines[offset : offset+h]
 	}
 
-	// Pad to fill height
 	for len(lines) < h {
 		lines = append(lines, "")
 	}
 
-	// Truncate each line to width
 	for i, line := range lines {
 		lw := lipgloss.Width(line)
 		if lw < w {
@@ -310,167 +328,122 @@ func (m model) renderTargetList(w, h int) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderPreview renders the right pane: info about the highlighted target.
-func (m model) renderPreview(w, h int) string {
-	border := lipgloss.RoundedBorder()
-	bs := previewBorderStyle
-
-	// Inner dimensions (subtract border + 1 char padding each side)
-	innerW := w - 4
-	innerH := h - 2
-	if innerW < 5 || innerH < 3 {
+// renderInlinePreview renders preview content for `target` into exactly w x h
+// cells. Short content is padded with blank rows so the preview always takes
+// the same height — this keeps the list above from resizing as the cursor
+// moves across targets with different-sized metadata.
+func renderInlinePreview(target MakeTarget, w, h int) string {
+	if w < 4 || h < 1 {
 		return ""
 	}
 
-	var contentLines []string
+	var lines []string
 
-	if len(m.filtered) > 0 {
-		target := m.flat[m.filtered[m.cursor]]
+	fullName := target.Name
+	if target.Dir != "." {
+		fullName = target.Dir + "/" + target.Name
+	}
+	lines = append(lines, previewNameStyle.Render(truncateStr(fullName, w)))
 
-		// Target name
-		fullName := target.Name
-		if target.Dir != "." {
-			fullName = target.Dir + "/" + target.Name
-		}
-		contentLines = append(contentLines, previewNameStyle.Render(fullName))
-		contentLines = append(contentLines, "")
-
-		// Description
-		if target.Description != "" {
-			wrapped := wordWrap(target.Description, innerW)
-			for _, wl := range strings.Split(wrapped, "\n") {
-				contentLines = append(contentLines, descStyle.Render(wl))
-			}
-			contentLines = append(contentLines, "")
-		}
-
-		// Dependencies
-		if len(target.Dependencies) > 0 {
-			depsStr := strings.Join(target.Dependencies, ", ")
-			contentLines = append(contentLines, depsLabelStyle.Render("deps ")+depsValueStyle.Render(depsStr))
-			contentLines = append(contentLines, "")
-		}
-
-		// Recipe
-		if len(target.Recipe) > 0 {
-			for _, rl := range target.Recipe {
-				if lipgloss.Width(rl) > innerW {
-					rl = rl[:innerW-1] + "…"
-				}
-				contentLines = append(contentLines, recipeStyle.Render(rl))
-			}
-		} else {
-			contentLines = append(contentLines, noMatchStyle.Render("(no recipe)"))
+	if target.Description != "" {
+		wrapped := wordWrap(target.Description, w)
+		for _, wl := range strings.Split(wrapped, "\n") {
+			lines = append(lines, descStyle.Render(truncateStr(wl, w)))
 		}
 	}
 
-	// Trim to available height
-	if len(contentLines) > innerH {
-		contentLines = contentLines[:innerH]
+	if len(target.Dependencies) > 0 {
+		depsStr := strings.Join(target.Dependencies, ", ")
+		prefix := "deps "
+		avail := w - len(prefix)
+		if avail > 0 {
+			lines = append(lines, depsLabelStyle.Render(prefix)+depsValueStyle.Render(truncateStr(depsStr, avail)))
+		}
 	}
 
-	// Pad to fill inner height
-	for len(contentLines) < innerH {
-		contentLines = append(contentLines, "")
+	if len(target.Recipe) > 0 {
+		if len(lines) > 1 {
+			lines = append(lines, "")
+		}
+		for _, rl := range target.Recipe {
+			lines = append(lines, recipeStyle.Render(truncateStr(rl, w)))
+		}
 	}
 
-	// Pad each line to inner width
-	for i, line := range contentLines {
+	if len(lines) > h {
+		lines = lines[:h]
+	}
+	for len(lines) < h {
+		lines = append(lines, "")
+	}
+
+	for i, line := range lines {
 		lw := lipgloss.Width(line)
-		if lw < innerW {
-			contentLines[i] = line + strings.Repeat(" ", innerW-lw)
+		if lw < w {
+			lines[i] = line + strings.Repeat(" ", w-lw)
 		}
 	}
 
-	// Build the bordered preview box manually
-	label := " preview "
-	topFill := innerW + 2 - lipgloss.Width(label) - 1 // +2 for padding, -1 for left dash
-	if topFill < 0 {
-		topFill = 0
-	}
-	top := bs.Render(border.TopLeft+"─") +
-		previewLabelStyle.Render(label) +
-		bs.Render(strings.Repeat("─", topFill)+border.TopRight)
-
-	bottom := bs.Render(border.BottomLeft + strings.Repeat("─", innerW+2) + border.BottomRight)
-
-	var rows []string
-	rows = append(rows, top)
-	for _, cl := range contentLines {
-		rows = append(rows, bs.Render(border.Left)+" "+cl+" "+bs.Render(border.Right))
-	}
-	rows = append(rows, bottom)
-
-	return strings.Join(rows, "\n")
+	return strings.Join(lines, "\n")
 }
 
-// renderPanel constructs the outer bordered panel with title in top border and help in bottom.
-func (m model) renderPanel(body string, panelW int) string {
-	border := lipgloss.RoundedBorder()
-	bs := borderStyle
+// renderTopLine renders the prompt line: `mkm › <filter>` on the left, help keys on the right.
+func (m model) renderTopLine(w int) string {
+	left := titleStyle.Render("mkm") + filterPromptStyle.Render(" › ")
+	leftW := lipgloss.Width(left)
 
-	innerW := panelW - 2 // subtract left + right border chars
+	help := m.renderHelpKeys()
+	helpW := lipgloss.Width(help)
 
-	// Top border with title
-	var titleTag string
-	var titleLen int
-	if m.filter == "" {
-		titleTag = bs.Render("[ ") + titleStyle.Render("mkm") + bs.Render(" ]")
-		titleLen = 7 // "[ mkm ]"
-	} else {
-		titleTag = bs.Render("[ ") + titleStyle.Render("mkm") + " " +
-			filterPromptStyle.Render("/") +
-			filterStyle.Render(m.filter) + bs.Render(" ]")
-		titleLen = 7 + 1 + len(m.filter) // "[ mkm /filter ]"
-	}
-	topFill := innerW - titleLen - 2 // 2 for leading "──"
-	if topFill < 0 {
-		topFill = 0
-	}
-	top := bs.Render(border.TopLeft+"──") + titleTag + bs.Render(strings.Repeat("─", topFill)+border.TopRight)
-
-	// Bottom border with help
-	var helpText string
-	if m.filter == "" {
-		helpText = helpKeyStyle.Render("type to filter") + bs.Render("  ") +
-			helpKeyStyle.Render("↑↓") + bs.Render("  ") +
-			helpKeyStyle.Render("enter") + bs.Render("  ") +
-			helpKeyStyle.Render("esc")
-	} else {
-		helpText = helpKeyStyle.Render("/"+m.filter) + bs.Render("  ") +
-			helpKeyStyle.Render("↑↓") + bs.Render("  ") +
-			helpKeyStyle.Render("enter") + bs.Render("  ") +
-			helpKeyStyle.Render("bksp") + bs.Render("  ") +
-			helpKeyStyle.Render("esc")
-	}
-	helpLen := lipgloss.Width(helpText)
-	botFill := innerW - helpLen - 4 // 4 for "[ " and " ]"
-	if botFill < 0 {
-		botFill = 0
-	}
-	bottom := bs.Render(border.BottomLeft+strings.Repeat("─", botFill)) +
-		bs.Render("[ ") + helpText + bs.Render(" ]") +
-		bs.Render(border.BottomRight)
-
-	// Body rows with side borders and padding
-	bodyLines := strings.Split(body, "\n")
-	var rows []string
-	rows = append(rows, top)
-	// Top padding row
-	rows = append(rows, bs.Render(border.Left)+strings.Repeat(" ", innerW)+bs.Render(border.Right))
-	for _, bl := range bodyLines {
-		lw := lipgloss.Width(bl)
-		pad := innerW - 2 - lw // 2 for left padding
-		if pad < 0 {
-			pad = 0
+	// Gap between filter and help keys.
+	gap := 2
+	avail := w - leftW - helpW - gap
+	if avail < 0 {
+		// Not enough room for help — drop it.
+		help = ""
+		helpW = 0
+		avail = w - leftW
+		if avail < 0 {
+			avail = 0
 		}
-		rows = append(rows, bs.Render(border.Left)+"  "+bl+strings.Repeat(" ", pad)+bs.Render(border.Right))
 	}
-	// Bottom padding row
-	rows = append(rows, bs.Render(border.Left)+strings.Repeat(" ", innerW)+bs.Render(border.Right))
-	rows = append(rows, bottom)
 
-	return strings.Join(rows, "\n")
+	var filterPart string
+	if m.filter == "" {
+		hint := "type to filter"
+		if len(hint) <= avail {
+			filterPart = noMatchStyle.Render(hint)
+		}
+	} else {
+		display := m.filter
+		if len(display) > avail {
+			display = truncateStr(display, avail)
+		}
+		filterPart = filterStyle.Render(display)
+	}
+	filterW := lipgloss.Width(filterPart)
+
+	pad := w - leftW - filterW - helpW
+	if pad < 0 {
+		pad = 0
+	}
+
+	return left + filterPart + strings.Repeat(" ", pad) + help
+}
+
+func (m model) renderHelpKeys() string {
+	gap := ruleStyle.Render("  ")
+	segs := []string{
+		helpKeyStyle.Render("↑↓"),
+		helpKeyStyle.Render("enter"),
+	}
+	if m.showPreview {
+		segs = append(segs, helpKeyStyle.Render("tab:hide"))
+	} else {
+		segs = append(segs, helpKeyStyle.Render("tab:show"))
+	}
+	segs = append(segs, helpKeyStyle.Render("esc"))
+	return strings.Join(segs, gap)
 }
 
 func (m model) View() string {
@@ -478,35 +451,43 @@ func (m model) View() string {
 		return ""
 	}
 
-	// Calculate panel dimensions
-	panelW := int(float64(m.width) * 0.65)
-	panelH := int(float64(m.height) * 0.70)
-	panelW = clamp(panelW, 50, m.width-4)
-	panelH = clamp(panelH, 15, m.height-2)
-
-	// Inner area (subtract border, padding rows)
-	innerW := panelW - 2 - 4 // border(2) + left padding indent(4)
-	innerH := panelH - 4     // border(2) + padding rows(2)
-	if innerW < 20 {
-		innerW = 20
-	}
-	if innerH < 5 {
-		innerH = 5
+	w := m.width
+	h := m.height
+	if w < 10 || h < 3 {
+		return ""
 	}
 
-	// Split into left list and right preview
-	leftW := int(float64(innerW) * 0.50)
-	rightW := innerW - leftW - 2 // 2 char gap
+	top := m.renderTopLine(w)
+	rule := ruleStyle.Render(strings.Repeat("─", w))
 
-	leftContent := m.renderTargetList(leftW, innerH)
-	rightContent := m.renderPreview(rightW, innerH)
+	// Top prompt + rule eat 2 rows.
+	remain := h - 2
+	if remain < 1 {
+		return top + "\n" + rule
+	}
 
-	// Join horizontally with gap
-	body := lipgloss.JoinHorizontal(lipgloss.Top, leftContent, "  ", rightContent)
+	var parts []string
+	parts = append(parts, top)
+	parts = append(parts, rule)
 
-	panel := m.renderPanel(body, panelW)
+	// Fixed preview height (≈ a third of the vertical space) keeps the list
+	// above from shifting as the cursor moves across targets with different
+	// amounts of metadata.
+	if m.showPreview && len(m.filtered) > 0 && remain >= 8 {
+		previewH := remain / 3
+		if previewH < 4 {
+			previewH = 4
+		}
+		target := m.flat[m.filtered[m.cursor]]
+		listH := remain - 1 - previewH // 1 for the rule between list and preview
+		parts = append(parts, m.renderTargetList(w, listH))
+		parts = append(parts, rule)
+		parts = append(parts, renderInlinePreview(target, w, previewH))
+		return strings.Join(parts, "\n")
+	}
 
-	return lipgloss.Place(m.width, m.height, lipgloss.Center, lipgloss.Center, panel)
+	parts = append(parts, m.renderTargetList(w, remain))
+	return strings.Join(parts, "\n")
 }
 
 func wordWrap(s string, width int) string {
@@ -526,16 +507,6 @@ func wordWrap(s string, width int) string {
 	}
 	lines = append(lines, current)
 	return strings.Join(lines, "\n")
-}
-
-func clamp(v, lo, hi int) int {
-	if v < lo {
-		return lo
-	}
-	if v > hi {
-		return hi
-	}
-	return v
 }
 
 func makeCmd(target MakeTarget) []string {
