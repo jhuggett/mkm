@@ -1,81 +1,15 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
+	"os/exec"
 	"strings"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	termenv "github.com/muesli/termenv"
-)
-
-var (
-	accent      = lipgloss.Color("#d08770")
-	dimColor    = lipgloss.Color("#4c566a")
-	subtleColor = lipgloss.Color("#3b4252")
-	textColor   = lipgloss.Color("#7a8490")
-	hiColor     = lipgloss.Color("#d8dee9")
-	cyanColor   = lipgloss.Color("#5e81ac")
-	greenColor  = lipgloss.Color("#a3be8c")
-	purpleColor = lipgloss.Color("#b48ead")
-	yellowColor = lipgloss.Color("#ebcb8b")
-
-	titleStyle = lipgloss.NewStyle().
-			Foreground(accent).
-			Bold(true)
-
-	filterStyle = lipgloss.NewStyle().
-			Foreground(hiColor).
-			Bold(true)
-
-	filterPromptStyle = lipgloss.NewStyle().
-				Foreground(accent)
-
-	groupHeaderStyle = lipgloss.NewStyle().
-				Foreground(cyanColor)
-
-	selectedItemStyle = lipgloss.NewStyle().
-				Foreground(hiColor).
-				Bold(true)
-
-	selectedCursorStyle = lipgloss.NewStyle().
-				Foreground(accent).
-				Bold(true)
-
-	normalItemStyle = lipgloss.NewStyle().
-			Foreground(textColor)
-
-	matchStyle = lipgloss.NewStyle().
-			Foreground(accent)
-
-	helpKeyStyle = lipgloss.NewStyle().
-			Foreground(dimColor)
-
-	ruleStyle = lipgloss.NewStyle().
-			Foreground(subtleColor)
-
-	descStyle = lipgloss.NewStyle().
-			Foreground(yellowColor).
-			Italic(true)
-
-	depsLabelStyle = lipgloss.NewStyle().
-			Foreground(purpleColor).
-			Bold(true)
-
-	depsValueStyle = lipgloss.NewStyle().
-			Foreground(textColor)
-
-	recipeStyle = lipgloss.NewStyle().
-			Foreground(greenColor)
-
-	noMatchStyle = lipgloss.NewStyle().
-			Foreground(dimColor).
-			Italic(true)
-
-	previewNameStyle = lipgloss.NewStyle().
-				Foreground(hiColor).
-				Bold(true)
 )
 
 type model struct {
@@ -88,6 +22,12 @@ type model struct {
 	height      int
 	filter      string
 	showPreview bool
+	showHelp    bool
+	form        *formState
+	viewer      *viewerState
+	scaffold    *scaffoldState
+	history     map[string]int64
+	layout      *listLayoutCache
 }
 
 func newModel(groups []TargetGroup) model {
@@ -106,72 +46,8 @@ func newModel(groups []TargetGroup) model {
 		width:       80,
 		height:      24,
 		showPreview: true,
-	}
-}
-
-func fuzzyMatch(s, pattern string) bool {
-	s = strings.ToLower(s)
-	pattern = strings.ToLower(pattern)
-	pi := 0
-	for i := 0; i < len(s) && pi < len(pattern); i++ {
-		if s[i] == pattern[pi] {
-			pi++
-		}
-	}
-	return pi == len(pattern)
-}
-
-func fuzzyHighlight(s, pattern string, base, highlight lipgloss.Style) string {
-	if pattern == "" {
-		return base.Render(s)
-	}
-	lower := strings.ToLower(s)
-	pat := strings.ToLower(pattern)
-	var b strings.Builder
-	pi := 0
-	run := []byte{}
-	matched := false
-	for i := 0; i < len(s); i++ {
-		if pi < len(pat) && lower[i] == pat[pi] {
-			if !matched && len(run) > 0 {
-				b.WriteString(base.Render(string(run)))
-				run = run[:0]
-			}
-			matched = true
-			run = append(run, s[i])
-			pi++
-		} else {
-			if matched && len(run) > 0 {
-				b.WriteString(highlight.Render(string(run)))
-				run = run[:0]
-			}
-			matched = false
-			run = append(run, s[i])
-		}
-	}
-	if len(run) > 0 {
-		if matched {
-			b.WriteString(highlight.Render(string(run)))
-		} else {
-			b.WriteString(base.Render(string(run)))
-		}
-	}
-	return b.String()
-}
-
-func (m *model) updateFilter() {
-	m.filtered = m.filtered[:0]
-	for i, t := range m.flat {
-		label := t.Name
-		if t.Dir != "." {
-			label = t.Dir + "/" + t.Name
-		}
-		if fuzzyMatch(label, m.filter) {
-			m.filtered = append(m.filtered, i)
-		}
-	}
-	if m.cursor >= len(m.filtered) {
-		m.cursor = max(0, len(m.filtered)-1)
+		history:     loadHistory(),
+		layout:      &listLayoutCache{rowToIdx: map[int]int{}},
 	}
 }
 
@@ -179,273 +55,91 @@ func (m model) Init() tea.Cmd {
 	return nil
 }
 
+// Update dispatches to mode-specific handlers in list.go / form.go /
+// viewer.go. This file just owns the top-level routing.
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case editorFinishedMsg:
+		// Editor may have modified the Makefile; re-parse to pick up changes.
+		if flat, groups, err := collectTargets(); err == nil {
+			m.flat = flat
+			m.groups = groups
+			m.updateFilter()
+			m.form = nil // form target pointer is now stale
+			if m.viewer != nil {
+				if err := m.viewer.reload(m.flat); err == nil {
+					m.clampViewer()
+				}
+			}
+		}
+		return m, nil
+	case tea.MouseMsg:
+		return m.updateMouse(msg)
 	case tea.KeyMsg:
-		switch msg.String() {
-		case "esc", "ctrl+c":
-			return m, tea.Quit
-		case "tab":
-			m.showPreview = !m.showPreview
-		case "up", "ctrl+p":
-			if len(m.filtered) > 0 {
-				if m.cursor > 0 {
-					m.cursor--
-				} else {
-					m.cursor = len(m.filtered) - 1
-				}
-			}
-		case "down", "ctrl+n":
-			if len(m.filtered) > 0 {
-				if m.cursor < len(m.filtered)-1 {
-					m.cursor++
-				} else {
-					m.cursor = 0
-				}
-			}
-		case "enter":
-			if len(m.filtered) > 0 {
-				m.selected = true
+		if m.showHelp {
+			if msg.String() == "ctrl+c" {
 				return m, tea.Quit
 			}
-		case "backspace":
-			if len(m.filter) > 0 {
-				m.filter = m.filter[:len(m.filter)-1]
-				m.updateFilter()
-			}
-		default:
-			r := msg.String()
-			if len(r) == 1 && r[0] >= 32 && r[0] < 127 {
-				m.filter += r
-				m.updateFilter()
+			m.showHelp = false
+			return m, nil
+		}
+		if m.scaffold != nil {
+			return m.updateScaffold(msg)
+		}
+		if m.viewer != nil {
+			return m.updateViewer(msg)
+		}
+		if m.form != nil {
+			return m.updateForm(msg)
+		}
+		return m.updateList(msg)
+	}
+	return m, nil
+}
+
+func (m model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
+	if msg.Action != tea.MouseActionPress {
+		return m, nil
+	}
+	if m.viewer != nil {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.viewer.cursor -= 3
+			m.clampViewer()
+		case tea.MouseButtonWheelDown:
+			m.viewer.cursor += 3
+			m.clampViewer()
+		}
+		return m, nil
+	}
+	if m.form != nil {
+		return m, nil
+	}
+	// List mode: wheel moves cursor, left click sets cursor on clicked row.
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		if len(m.filtered) > 0 && m.cursor > 0 {
+			m.cursor--
+		}
+	case tea.MouseButtonWheelDown:
+		if len(m.filtered) > 0 && m.cursor < len(m.filtered)-1 {
+			m.cursor++
+		}
+	case tea.MouseButtonLeft:
+		if m.layout != nil {
+			row := msg.Y - m.layout.firstRow
+			if idx, ok := m.layout.rowToIdx[row]; ok {
+				m.cursor = idx
 			}
 		}
 	}
 	return m, nil
 }
 
-// truncateStr truncates s to fit within width visible characters, adding … if truncated.
-func truncateStr(s string, width int) string {
-	if width <= 0 {
-		return ""
-	}
-	if len(s) <= width {
-		return s
-	}
-	if width <= 1 {
-		return "…"
-	}
-	return s[:width-1] + "…"
-}
-
-// renderTargetList renders the grouped target list filling w x h exactly.
-func (m model) renderTargetList(w, h int) string {
-	var lines []string
-	cursorLine := 0
-
-	if len(m.filtered) == 0 {
-		lines = append(lines, noMatchStyle.Render(truncateStr("no matches", w)))
-	} else {
-		visibleSet := map[int]bool{}
-		for _, fi := range m.filtered {
-			visibleSet[fi] = true
-		}
-
-		filteredIdx := 0
-		flatIdx := 0
-		for gi, g := range m.groups {
-			hasVisible := false
-			for range g.Targets {
-				if visibleSet[flatIdx] {
-					hasVisible = true
-				}
-				flatIdx++
-			}
-			flatIdx -= len(g.Targets)
-
-			if !hasVisible {
-				flatIdx += len(g.Targets)
-				continue
-			}
-
-			if len(lines) > 0 {
-				lines = append(lines, "")
-			}
-
-			if g.Dir != "." {
-				lines = append(lines, groupHeaderStyle.Render(truncateStr(g.Dir+"/", w)))
-			} else if gi == 0 {
-				// Don't label the root group at all if it's first
-			}
-
-			labelW := w - 3
-			if labelW < 1 {
-				labelW = 1
-			}
-			for _, t := range g.Targets {
-				if visibleSet[flatIdx] {
-					label := truncateStr(t.Name, labelW)
-					if filteredIdx == m.cursor {
-						cursorLine = len(lines)
-						hl := fuzzyHighlight(label, m.filter, selectedItemStyle, selectedCursorStyle)
-						lines = append(lines, selectedCursorStyle.Render(" > ")+hl)
-					} else {
-						hl := fuzzyHighlight(label, m.filter, normalItemStyle, matchStyle)
-						lines = append(lines, "   "+hl)
-					}
-					filteredIdx++
-				}
-				flatIdx++
-			}
-		}
-	}
-
-	if len(lines) > h {
-		offset := cursorLine - h/3
-		if offset < 0 {
-			offset = 0
-		}
-		if offset > len(lines)-h {
-			offset = len(lines) - h
-		}
-		lines = lines[offset : offset+h]
-	}
-
-	for len(lines) < h {
-		lines = append(lines, "")
-	}
-
-	for i, line := range lines {
-		lw := lipgloss.Width(line)
-		if lw < w {
-			lines[i] = line + strings.Repeat(" ", w-lw)
-		}
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-// renderInlinePreview renders preview content for `target` into exactly w x h
-// cells. Short content is padded with blank rows so the preview always takes
-// the same height — this keeps the list above from resizing as the cursor
-// moves across targets with different-sized metadata.
-func renderInlinePreview(target MakeTarget, w, h int) string {
-	if w < 4 || h < 1 {
-		return ""
-	}
-
-	var lines []string
-
-	fullName := target.Name
-	if target.Dir != "." {
-		fullName = target.Dir + "/" + target.Name
-	}
-	lines = append(lines, previewNameStyle.Render(truncateStr(fullName, w)))
-
-	if target.Description != "" {
-		wrapped := wordWrap(target.Description, w)
-		for _, wl := range strings.Split(wrapped, "\n") {
-			lines = append(lines, descStyle.Render(truncateStr(wl, w)))
-		}
-	}
-
-	if len(target.Dependencies) > 0 {
-		depsStr := strings.Join(target.Dependencies, ", ")
-		prefix := "deps "
-		avail := w - len(prefix)
-		if avail > 0 {
-			lines = append(lines, depsLabelStyle.Render(prefix)+depsValueStyle.Render(truncateStr(depsStr, avail)))
-		}
-	}
-
-	if len(target.Recipe) > 0 {
-		if len(lines) > 1 {
-			lines = append(lines, "")
-		}
-		for _, rl := range target.Recipe {
-			lines = append(lines, recipeStyle.Render(truncateStr(rl, w)))
-		}
-	}
-
-	if len(lines) > h {
-		lines = lines[:h]
-	}
-	for len(lines) < h {
-		lines = append(lines, "")
-	}
-
-	for i, line := range lines {
-		lw := lipgloss.Width(line)
-		if lw < w {
-			lines[i] = line + strings.Repeat(" ", w-lw)
-		}
-	}
-
-	return strings.Join(lines, "\n")
-}
-
-// renderTopLine renders the prompt line: `mkm › <filter>` on the left, help keys on the right.
-func (m model) renderTopLine(w int) string {
-	left := titleStyle.Render("mkm") + filterPromptStyle.Render(" › ")
-	leftW := lipgloss.Width(left)
-
-	help := m.renderHelpKeys()
-	helpW := lipgloss.Width(help)
-
-	// Gap between filter and help keys.
-	gap := 2
-	avail := w - leftW - helpW - gap
-	if avail < 0 {
-		// Not enough room for help — drop it.
-		help = ""
-		helpW = 0
-		avail = w - leftW
-		if avail < 0 {
-			avail = 0
-		}
-	}
-
-	var filterPart string
-	if m.filter == "" {
-		hint := "type to filter"
-		if len(hint) <= avail {
-			filterPart = noMatchStyle.Render(hint)
-		}
-	} else {
-		display := m.filter
-		if len(display) > avail {
-			display = truncateStr(display, avail)
-		}
-		filterPart = filterStyle.Render(display)
-	}
-	filterW := lipgloss.Width(filterPart)
-
-	pad := w - leftW - filterW - helpW
-	if pad < 0 {
-		pad = 0
-	}
-
-	return left + filterPart + strings.Repeat(" ", pad) + help
-}
-
-func (m model) renderHelpKeys() string {
-	gap := ruleStyle.Render("  ")
-	segs := []string{
-		helpKeyStyle.Render("↑↓"),
-		helpKeyStyle.Render("enter"),
-	}
-	if m.showPreview {
-		segs = append(segs, helpKeyStyle.Render("tab:hide"))
-	} else {
-		segs = append(segs, helpKeyStyle.Render("tab:show"))
-	}
-	segs = append(segs, helpKeyStyle.Render("esc"))
-	return strings.Join(segs, gap)
-}
-
+// View dispatches to the right render fn based on current mode.
 func (m model) View() string {
 	if m.selected {
 		return ""
@@ -457,10 +151,22 @@ func (m model) View() string {
 		return ""
 	}
 
+	if m.showHelp {
+		return m.renderHelpView(w, h)
+	}
+	if m.scaffold != nil {
+		return m.renderScaffoldView(w, h)
+	}
+	if m.viewer != nil {
+		return m.renderViewerView(w, h)
+	}
+	if m.form != nil {
+		return m.renderFormView(w, h)
+	}
+
 	top := m.renderTopLine(w)
 	rule := ruleStyle.Render(strings.Repeat("─", w))
 
-	// Top prompt + rule eat 2 rows.
 	remain := h - 2
 	if remain < 1 {
 		return top + "\n" + rule
@@ -469,6 +175,11 @@ func (m model) View() string {
 	var parts []string
 	parts = append(parts, top)
 	parts = append(parts, rule)
+
+	// List body always begins on row 2 (row 0 = prompt, row 1 = rule).
+	if m.layout != nil {
+		m.layout.firstRow = 2
+	}
 
 	// Fixed preview height (≈ a third of the vertical space) keeps the list
 	// above from shifting as the cursor moves across targets with different
@@ -479,7 +190,7 @@ func (m model) View() string {
 			previewH = 4
 		}
 		target := m.flat[m.filtered[m.cursor]]
-		listH := remain - 1 - previewH // 1 for the rule between list and preview
+		listH := remain - 1 - previewH
 		parts = append(parts, m.renderTargetList(w, listH))
 		parts = append(parts, rule)
 		parts = append(parts, renderInlinePreview(target, w, previewH))
@@ -490,60 +201,74 @@ func (m model) View() string {
 	return strings.Join(parts, "\n")
 }
 
-func wordWrap(s string, width int) string {
-	words := strings.Fields(s)
-	if len(words) == 0 {
-		return ""
+// collectTargets walks the cwd for Makefiles, parses each, and returns the
+// flat list + grouped-by-dir view. Groups also carry the file-level
+// @param declarations from their Makefile. Used at startup and after the
+// editor exits so we can reflect on-disk changes without restarting mkm.
+func collectTargets() ([]MakeTarget, []TargetGroup, error) {
+	makefiles, err := findMakefiles()
+	if err != nil {
+		return nil, nil, err
 	}
-	var lines []string
-	current := words[0]
-	for _, word := range words[1:] {
-		if len(current)+1+len(word) > width {
-			lines = append(lines, current)
-			current = word
-		} else {
-			current += " " + word
+	type perFile struct {
+		targets []MakeTarget
+		params  []MakeParam
+	}
+	byDir := map[string]*perFile{}
+	var all []MakeTarget
+	for _, mf := range makefiles {
+		ts, fileParams, err := parseMakefileTargets(mf)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse %s: %w", mf, err)
+		}
+		all = append(all, ts...)
+		dir := filepathDir(mf)
+		if len(ts) > 0 {
+			dir = ts[0].Dir
+		}
+		if _, ok := byDir[dir]; !ok {
+			byDir[dir] = &perFile{}
+		}
+		byDir[dir].targets = append(byDir[dir].targets, ts...)
+		byDir[dir].params = append(byDir[dir].params, fileParams...)
+	}
+
+	groups := groupTargets(all)
+	for i := range groups {
+		if pf, ok := byDir[groups[i].Dir]; ok {
+			groups[i].Params = pf.params
 		}
 	}
-	lines = append(lines, current)
-	return strings.Join(lines, "\n")
+	annotateTargets(all, groups)
+	return all, groups, nil
 }
 
-func makeCmd(target MakeTarget) []string {
-	if target.Dir == "." {
-		return []string{"make", target.Name}
+// filepathDir is a tiny wrapper so we don't need to import path/filepath
+// just for one call here (main.go already imports os+strings etc.).
+func filepathDir(p string) string {
+	for i := len(p) - 1; i >= 0; i-- {
+		if p[i] == '/' {
+			return p[:i]
+		}
 	}
-	return []string{"make", "-C", target.Dir, target.Name}
+	return "."
 }
 
 func main() {
-	makefiles, err := findMakefiles()
+	var runFlag bool
+	flag.BoolVar(&runFlag, "r", false, "run the selected command directly instead of printing it to stdout")
+	flag.BoolVar(&runFlag, "run", false, "run the selected command directly instead of printing it to stdout")
+	flag.Parse()
+
+	allTargets, groups, err := collectTargets()
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "Error finding Makefiles:", err)
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
-
-	if len(makefiles) == 0 {
-		fmt.Fprintln(os.Stderr, "No Makefiles found.")
-		os.Exit(1)
-	}
-
-	var allTargets []MakeTarget
-	for _, makefile := range makefiles {
-		targets, err := parseMakefileTargets(makefile)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error parsing Makefile %s: %v\n", makefile, err)
-			os.Exit(1)
-		}
-		allTargets = append(allTargets, targets...)
-	}
-
 	if len(allTargets) == 0 {
-		fmt.Fprintln(os.Stderr, "No targets found in Makefiles.")
+		fmt.Fprintln(os.Stderr, "No Makefile targets found.")
 		os.Exit(1)
 	}
-
-	groups := groupTargets(allTargets)
 
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
@@ -559,6 +284,7 @@ func main() {
 		tea.WithInput(tty),
 		tea.WithOutput(tty),
 		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
 	)
 
 	m, err := p.Run()
@@ -568,8 +294,37 @@ func main() {
 	}
 
 	finalModel := m.(model)
-	if finalModel.selected {
-		target := finalModel.flat[finalModel.filtered[finalModel.cursor]]
-		fmt.Println(strings.Join(makeCmd(target), " "))
+	if !finalModel.selected {
+		return
 	}
+
+	var args []string
+	if finalModel.form != nil {
+		appendHistory(*finalModel.form.target)
+		args = makeCmd(*finalModel.form.target, finalModel.form.params, finalModel.form.values)
+	} else {
+		target := finalModel.flat[finalModel.filtered[finalModel.cursor]]
+		appendHistory(target)
+		args = makeCmd(target, nil, nil)
+	}
+
+	if runFlag {
+		// Exec the make command directly, wiring std streams so the user sees
+		// output like a normal `make` invocation.
+		c := exec.Command(args[0], args[1:]...)
+		c.Stdin = os.Stdin
+		c.Stdout = os.Stdout
+		c.Stderr = os.Stderr
+		if err := c.Run(); err != nil {
+			if exitErr, ok := err.(*exec.ExitError); ok {
+				os.Exit(exitErr.ExitCode())
+			}
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(1)
+		}
+		return
+	}
+
+	// Default: print the command so the shell wrapper can eval it.
+	fmt.Println(strings.Join(args, " "))
 }

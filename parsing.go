@@ -2,10 +2,20 @@ package main
 
 import (
 	"bufio"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 )
+
+type MakeParam struct {
+	Name        string
+	Kind        string   // "string", "int", "bool", "enum"
+	Options     []string // only for enum
+	Default     string
+	Required    bool
+	Description string
+}
 
 type MakeTarget struct {
 	Name         string
@@ -13,11 +23,21 @@ type MakeTarget struct {
 	Description  string
 	Dependencies []string
 	Recipe       []string
+	Params       []MakeParam
+	File         string // path to the Makefile (relative to cwd)
+	Line         int    // 1-based line number of the target definition
+	// Annotation flags computed once after parsing (see annotateTargets).
+	HasParams   bool // has its own @param or references a file-level @param
+	HasScaffold bool // has $(VAR) refs not covered by @param or file assignments
 }
 
 type TargetGroup struct {
 	Dir     string
 	Targets []MakeTarget
+	// Params are @param lines declared at file scope in Dir/Makefile (not
+	// attached to any specific target). They apply to any target whose
+	// recipe references them.
+	Params []MakeParam
 }
 
 var excludedDirs = map[string]bool{
@@ -51,21 +71,123 @@ func findMakefiles() ([]string, error) {
 	return makefiles, nil
 }
 
-func parseMakefileTargets(makefilePath string) ([]MakeTarget, error) {
+// parseParam parses a `@param {type} NAME description` (or `[NAME=default]`) line.
+// Returns ok=false on malformed input so the caller can skip it silently.
+func parseParam(line string) (MakeParam, bool) {
+	line = strings.TrimSpace(strings.TrimPrefix(line, "@param"))
+
+	// {type}
+	if !strings.HasPrefix(line, "{") {
+		return MakeParam{}, false
+	}
+	end := strings.Index(line, "}")
+	if end < 0 {
+		return MakeParam{}, false
+	}
+	typeSpec := strings.TrimSpace(line[1:end])
+	line = strings.TrimSpace(line[end+1:])
+
+	var p MakeParam
+	if strings.Contains(typeSpec, "|") {
+		p.Kind = "enum"
+		for _, o := range strings.Split(typeSpec, "|") {
+			o = strings.TrimSpace(o)
+			if o != "" {
+				p.Options = append(p.Options, o)
+			}
+		}
+		if len(p.Options) < 2 {
+			return MakeParam{}, false
+		}
+	} else {
+		switch typeSpec {
+		case "string", "int", "bool":
+			p.Kind = typeSpec
+		default:
+			return MakeParam{}, false
+		}
+	}
+
+	// NAME or [NAME] or [NAME=default]
+	p.Required = true
+	if strings.HasPrefix(line, "[") {
+		end := strings.Index(line, "]")
+		if end < 0 {
+			return MakeParam{}, false
+		}
+		inside := line[1:end]
+		line = strings.TrimSpace(line[end+1:])
+		p.Required = false
+		if eq := strings.Index(inside, "="); eq >= 0 {
+			p.Name = strings.TrimSpace(inside[:eq])
+			p.Default = strings.TrimSpace(inside[eq+1:])
+		} else {
+			p.Name = strings.TrimSpace(inside)
+		}
+	} else {
+		parts := strings.SplitN(line, " ", 2)
+		p.Name = strings.TrimSpace(parts[0])
+		if len(parts) > 1 {
+			line = strings.TrimSpace(parts[1])
+		} else {
+			line = ""
+		}
+	}
+	if p.Name == "" {
+		return MakeParam{}, false
+	}
+	p.Description = line
+	return p, true
+}
+
+// validParamForTarget returns an error describing why p can't attach to a
+// target, or nil if it's fine. We surface these as warnings rather than
+// silently dropping so obvious mistakes get noticed.
+func validParamForTarget(p MakeParam) error {
+	if p.Kind == "enum" && p.Default != "" {
+		found := false
+		for _, o := range p.Options {
+			if o == p.Default {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("param %s: default %q not in options", p.Name, p.Default)
+		}
+	}
+	return nil
+}
+
+func parseMakefileTargets(makefilePath string) ([]MakeTarget, []MakeParam, error) {
 	file, err := os.Open(makefilePath)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer file.Close()
 
 	dir := filepath.Dir(makefilePath)
 
 	var targets []MakeTarget
+	var fileParams []MakeParam // @param lines not attached to any target
 	var commentBuf []string
+	var paramBuf []MakeParam
 	var current *MakeTarget
 
+	// promoteParams flushes paramBuf into fileParams. Called whenever a
+	// comment block ends without being claimed by a target definition —
+	// those orphaned `@param` lines represent project-wide annotations.
+	promoteParams := func() {
+		if len(paramBuf) > 0 {
+			fileParams = append(fileParams, paramBuf...)
+			paramBuf = nil
+		}
+	}
+
 	scanner := bufio.NewScanner(file)
+	lineNum := 0
 	for scanner.Scan() {
+		lineNum++
 		line := scanner.Text()
 		trimmed := strings.TrimSpace(line)
 
@@ -80,6 +202,7 @@ func parseMakefileTargets(makefilePath string) ([]MakeTarget, error) {
 
 		if trimmed == "" {
 			commentBuf = nil
+			promoteParams()
 			continue
 		}
 
@@ -90,7 +213,15 @@ func parseMakefileTargets(makefilePath string) ([]MakeTarget, error) {
 
 		if strings.HasPrefix(trimmed, "#") {
 			comment := strings.TrimSpace(strings.TrimPrefix(trimmed, "#"))
-			commentBuf = append(commentBuf, comment)
+			if strings.HasPrefix(comment, "@param") {
+				if p, ok := parseParam(comment); ok {
+					if err := validParamForTarget(p); err == nil {
+						paramBuf = append(paramBuf, p)
+					}
+				}
+			} else {
+				commentBuf = append(commentBuf, comment)
+			}
 			continue
 		}
 
@@ -136,21 +267,32 @@ func parseMakefileTargets(makefilePath string) ([]MakeTarget, error) {
 			}
 			commentBuf = nil
 
+			params := paramBuf
+			paramBuf = nil
+
 			targets = append(targets, MakeTarget{
 				Name:         name,
 				Dir:          dir,
 				Description:  desc,
 				Dependencies: deps,
+				Params:       params,
+				File:         makefilePath,
+				Line:         lineNum,
 			})
 			current = &targets[len(targets)-1]
 		} else {
+			// A non-target, non-comment, non-blank line (variable assignment,
+			// include, etc.) ends the current comment block. Any queued
+			// @params become file-level.
 			commentBuf = nil
+			promoteParams()
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	return targets, nil
+	promoteParams() // flush any trailing unattached @params at EOF
+	return targets, fileParams, nil
 }
 
 func groupTargets(targets []MakeTarget) []TargetGroup {

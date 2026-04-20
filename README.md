@@ -50,3 +50,7 @@ Run `mkm` in any directory containing a Makefile. It recursively finds Makefiles
 - Arrow keys to navigate
 - Enter to select
 - Esc to quit
+
+## Parameterized targets
+
+Targets that use variables can be annotated with `@param` comments so mkm prompts for values via a small form before running. See [PARAMS.md](PARAMS.md) for the spec.

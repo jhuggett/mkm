@@ -1,3 +1,6 @@
+# @param {string} [DEPLOY_KEY=]   API key used by deploy targets (file-level)
+# @param {dev|staging|prod} [ENV_DEFAULT=dev]  default environment (file-level)
+
 # Log a message from the abc subsystem
 .PHONY: log-abc
 log-abc:
@@ -526,3 +529,44 @@ feature-export: ## Export feature flag config
 	@echo "feature export"
 feature-import: ## Import feature flag config
 	@echo "feature import"
+
+# --- fixtures for @param form input ---
+
+# Deploy the app to an environment
+# @param {dev|staging|prod} ENV            target environment
+# @param {string} [VERSION=latest]         release tag
+# @param {bool} [DRY_RUN=false]            preview without executing
+.PHONY: deploy-app
+deploy-app:
+	@echo "deploying $(ENV) at $(VERSION) (dry-run=$(DRY_RUN))"
+
+# Run the e2e test suite
+# @param {chrome|firefox|safari|edge} [BROWSER=chrome]  browser to test against
+# @param {int} [WORKERS=4]                              parallel test workers
+# @param {bool} [HEADLESS=true]                         run without a display
+.PHONY: e2e-run
+e2e-run:
+	@echo "e2e on $(BROWSER) x$(WORKERS) headless=$(HEADLESS)"
+
+# Scaffold a new service from the template
+# @param {string} NAME                     service name (kebab-case)
+# @param {go|rust|ts} [LANG=go]            implementation language
+# @param {http|grpc|both} [TRANSPORT=http] transport surfaces
+.PHONY: scaffold-service
+scaffold-service:
+	@echo "scaffold $(NAME) lang=$(LANG) transport=$(TRANSPORT)"
+
+# Generate a release — takes a required version string
+# @param {string} VERSION                  semver tag (e.g. v1.2.3)
+# @param {string} [NOTES=]                 optional release notes path
+.PHONY: release-tag
+release-tag:
+	@echo "tag $(VERSION) notes=$(NOTES)"
+
+# Deploy using file-level params — recipe references both DEPLOY_KEY and
+# ENV_DEFAULT, so the form picks them up automatically without per-target
+# @param lines. Also has its own TAG param to show the merge with local params.
+# @param {string} [TAG=]  optional tag override
+.PHONY: deploy-filelevel
+deploy-filelevel:
+	@echo "deploy key=$(DEPLOY_KEY) env=$(ENV_DEFAULT) tag=$(TAG)"
