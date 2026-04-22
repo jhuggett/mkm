@@ -14,6 +14,7 @@ type Config struct {
 	Theme        string `json:"theme"`
 	WriteHistory bool   `json:"write_history"`
 	ShellHistory bool   `json:"shell_history"`
+	CheckUpdates bool   `json:"check_updates"`
 }
 
 func defaultConfig() Config {
@@ -21,6 +22,7 @@ func defaultConfig() Config {
 		Theme:        "nord",
 		WriteHistory: true,
 		ShellHistory: true,
+		CheckUpdates: true,
 	}
 }
 

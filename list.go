@@ -17,7 +17,13 @@ type listLayoutCache struct {
 }
 
 func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
+	key := msg.String()
+	// Transient "copied" toast for the update banner clears on the next
+	// keystroke — keeps the UI from accumulating stale feedback.
+	if key != "ctrl+u" {
+		m.updateMsg = ""
+	}
+	switch key {
 	case "esc", "ctrl+c":
 		return m, tea.Quit
 	case "ctrl+g":
@@ -73,8 +79,17 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			Theme:        currentThemeName(),
 			WriteHistory: m.writeHistory,
 			ShellHistory: m.shellHistory,
+			CheckUpdates: m.checkUpdates,
 		}
 		m.settings = newSettingsState(cfg)
+	case "ctrl+u":
+		if m.updateInfo.Available {
+			if err := copyToClipboard(installCommand()); err != nil {
+				m.updateMsg = "copy failed: " + err.Error()
+			} else {
+				m.updateMsg = "copied: " + installCommand()
+			}
+		}
 	case "backspace":
 		if len(m.filter) > 0 {
 			m.filter = m.filter[:len(m.filter)-1]
@@ -348,9 +363,13 @@ func renderInlinePreview(target MakeTarget, w, h int) string {
 	return strings.Join(lines, "\n")
 }
 
-// renderTopLine renders the prompt line: `mkm › <filter>` on the left, help keys on the right.
+// renderTopLine renders the prompt line: `mkm v2.0.0 › <filter>` on the
+// left (version styled dim so it doesn't dominate), help keys on the right.
+// Pseudo-versions render as "(dev <hash>)" via displayVersion to keep the
+// line from being hijacked by Go's timestamp+hash format.
 func (m model) renderTopLine(w int) string {
-	left := titleStyle.Render("mkm") + filterPromptStyle.Render(" › ")
+	version := helpKeyStyle.Render(" " + displayVersion())
+	left := titleStyle.Render("mkm") + version + filterPromptStyle.Render(" › ")
 	leftW := lipgloss.Width(left)
 
 	help := m.renderHelpKeys()
@@ -388,6 +407,44 @@ func (m model) renderTopLine(w int) string {
 	}
 
 	return left + filterPart + strings.Repeat(" ", pad) + help
+}
+
+// renderUpdateBanner returns the one-line "update available" banner shown
+// between the top line and the rule when a newer release is published.
+// Returns "" when there's nothing to show — the layout skips the row in
+// that case. Styling is deliberately punchy (accent color + arrow glyph)
+// so it stands out; the copy hint tells users how to dismiss it.
+func (m model) renderUpdateBanner(w int) string {
+	if !m.updateInfo.Available {
+		return ""
+	}
+	if m.updateMsg != "" {
+		prefix := filterPromptStyle.Render(" ◆ ")
+		return prefix + recipeStyle.Render(truncateStr(m.updateMsg, w-lipgloss.Width(prefix)))
+	}
+	prefix := filterPromptStyle.Render(" ▲ ")
+	main := filterStyle.Render("update available: ") +
+		titleStyle.Render(m.updateInfo.Latest) +
+		normalItemStyle.Render("  — run  ") +
+		recipeStyle.Render(installCommand()) +
+		noMatchStyle.Render("  (") +
+		helpKeyStyle.Render("^u") +
+		noMatchStyle.Render(" to copy)")
+	line := prefix + main
+	if lipgloss.Width(line) > w {
+		// Compact form when the fat banner overflows the viewport.
+		compact := prefix +
+			filterStyle.Render("update: ") +
+			titleStyle.Render(m.updateInfo.Latest) +
+			noMatchStyle.Render("  (") +
+			helpKeyStyle.Render("^u") +
+			noMatchStyle.Render(" to copy install command)")
+		if lipgloss.Width(compact) > w {
+			return filterStyle.Render(truncateStr(" ▲ update: "+m.updateInfo.Latest+" (^u)", w))
+		}
+		return compact
+	}
+	return line
 }
 
 func (m model) renderHelpKeys() string {

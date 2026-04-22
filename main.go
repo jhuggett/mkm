@@ -30,6 +30,9 @@ type model struct {
 	history      map[string]int64
 	writeHistory bool
 	shellHistory bool
+	checkUpdates bool
+	updateInfo   updateInfo
+	updateMsg    string // transient feedback after ctrl+u, cleared on next key
 	layout       *listLayoutCache
 }
 
@@ -60,11 +63,18 @@ func newModel(groups []TargetGroup, cfg Config) model {
 		history:      hist,
 		writeHistory: cfg.WriteHistory,
 		shellHistory: cfg.ShellHistory,
+		checkUpdates: cfg.CheckUpdates,
 		layout:       &listLayoutCache{rowToIdx: map[int]int{}},
 	}
 }
 
 func (m model) Init() tea.Cmd {
+	// Kick the update check in the background at startup; result arrives
+	// via updateCheckMsg. Skipped in dev builds (handled inside the cmd)
+	// and when the user opted out.
+	if m.checkUpdates {
+		return checkForUpdateCmd()
+	}
 	return nil
 }
 
@@ -75,6 +85,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+	case updateCheckMsg:
+		m.updateInfo = msg.info
+		return m, nil
 	case editorFinishedMsg:
 		// Editor may have modified the Makefile; re-parse to pick up changes.
 		if flat, groups, err := collectTargets(); err == nil {
@@ -192,19 +205,34 @@ func (m model) View() string {
 
 	top := m.renderTopLine(w)
 	rule := ruleStyle.Render(strings.Repeat("─", w))
+	banner := m.renderUpdateBanner(w)
 
-	remain := h - 2
+	// Banner (when present) sits between the top line and the rule; its
+	// row shifts the list body down by one and eats into the available
+	// list height.
+	bannerRows := 0
+	if banner != "" {
+		bannerRows = 1
+	}
+
+	remain := h - 2 - bannerRows
 	if remain < 1 {
+		if banner != "" {
+			return top + "\n" + banner + "\n" + rule
+		}
 		return top + "\n" + rule
 	}
 
 	var parts []string
 	parts = append(parts, top)
+	if banner != "" {
+		parts = append(parts, banner)
+	}
 	parts = append(parts, rule)
 
-	// List body always begins on row 2 (row 0 = prompt, row 1 = rule).
+	// Mouse click-to-row math: list body begins right after the rule.
 	if m.layout != nil {
-		m.layout.firstRow = 2
+		m.layout.firstRow = 2 + bannerRows
 	}
 
 	// Fixed preview height (≈ a third of the vertical space) keeps the list

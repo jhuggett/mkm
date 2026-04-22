@@ -37,6 +37,7 @@ const (
 	settingsFieldTheme = iota
 	settingsFieldWriteHistory
 	settingsFieldShellHistory
+	settingsFieldCheckUpdates
 	settingsFieldCount
 )
 
@@ -92,6 +93,7 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			_ = syncManagedWrapper(m.settings.shareHistShell, cfg.ShellHistory)
 		}
 		m.shellHistory = cfg.ShellHistory
+		m.checkUpdates = cfg.CheckUpdates
 		m.settings = nil
 		return m, nil
 	case "down", "tab":
@@ -115,6 +117,10 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case settingsFieldWriteHistory:
 		if key == " " || key == "left" || key == "right" {
 			m.settings.cfg.WriteHistory = !m.settings.cfg.WriteHistory
+		}
+	case settingsFieldCheckUpdates:
+		if key == " " || key == "left" || key == "right" {
+			m.settings.cfg.CheckUpdates = !m.settings.cfg.CheckUpdates
 		}
 	case settingsFieldShellHistory:
 		switch key {
@@ -267,6 +273,11 @@ func (m model) renderSettingsBody(w, h int) string {
 			name:  "shell_history",
 			desc:  "push mkm commands into shell history — governs HISTFILE append AND the managed wrapper's print -s / history -s line",
 			value: renderBoolValue(m.settings.cfg.ShellHistory),
+		},
+		{
+			name:  "check_updates",
+			desc:  "check GitHub daily for a newer mkm release (result cached in ~/.cache/mkm)",
+			value: renderBoolValue(m.settings.cfg.CheckUpdates),
 		},
 	}
 
