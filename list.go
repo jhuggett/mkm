@@ -68,6 +68,13 @@ func (m model) updateList(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			target := m.flat[m.filtered[m.cursor]]
 			m.scaffold = m.newScaffoldState(target)
 		}
+	case "ctrl+s":
+		cfg := Config{
+			Theme:        currentThemeName(),
+			WriteHistory: m.writeHistory,
+			ShellHistory: m.shellHistory,
+		}
+		m.settings = newSettingsState(cfg)
 	case "backspace":
 		if len(m.filter) > 0 {
 			m.filter = m.filter[:len(m.filter)-1]
@@ -391,6 +398,7 @@ func (m model) renderHelpKeys() string {
 		helpKeyStyle.Render("^v:view"),
 		helpKeyStyle.Render("^e:edit"),
 		helpKeyStyle.Render("^a:scaf"),
+		helpKeyStyle.Render("^s:set"),
 		helpKeyStyle.Render("^g:help"),
 	}
 	return strings.Join(segs, gap)

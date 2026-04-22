@@ -13,24 +13,27 @@ import (
 )
 
 type model struct {
-	groups      []TargetGroup
-	flat        []MakeTarget
-	filtered    []int
-	cursor      int
-	selected    bool
-	width       int
-	height      int
-	filter      string
-	showPreview bool
-	showHelp    bool
-	form        *formState
-	viewer      *viewerState
-	scaffold    *scaffoldState
-	history     map[string]int64
-	layout      *listLayoutCache
+	groups       []TargetGroup
+	flat         []MakeTarget
+	filtered     []int
+	cursor       int
+	selected     bool
+	width        int
+	height       int
+	filter       string
+	showPreview  bool
+	showHelp     bool
+	form         *formState
+	viewer       *viewerState
+	scaffold     *scaffoldState
+	settings     *settingsState
+	history      map[string]int64
+	writeHistory bool
+	shellHistory bool
+	layout       *listLayoutCache
 }
 
-func newModel(groups []TargetGroup) model {
+func newModel(groups []TargetGroup, cfg Config) model {
 	var flat []MakeTarget
 	for _, g := range groups {
 		flat = append(flat, g.Targets...)
@@ -39,15 +42,25 @@ func newModel(groups []TargetGroup) model {
 	for i := range flat {
 		filtered[i] = i
 	}
+	// When history is disabled, skip the load entirely — recency ranking just
+	// uses an empty map so every target scores equally on freshness.
+	var hist map[string]int64
+	if cfg.WriteHistory {
+		hist = loadHistory()
+	} else {
+		hist = map[string]int64{}
+	}
 	return model{
-		groups:      groups,
-		flat:        flat,
-		filtered:    filtered,
-		width:       80,
-		height:      24,
-		showPreview: true,
-		history:     loadHistory(),
-		layout:      &listLayoutCache{rowToIdx: map[int]int{}},
+		groups:       groups,
+		flat:         flat,
+		filtered:     filtered,
+		width:        80,
+		height:       24,
+		showPreview:  true,
+		history:      hist,
+		writeHistory: cfg.WriteHistory,
+		shellHistory: cfg.ShellHistory,
+		layout:       &listLayoutCache{rowToIdx: map[int]int{}},
 	}
 }
 
@@ -75,6 +88,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		}
+		// Editor may also have been pointed at the user's shell rc file
+		// from the shell_history row — refresh that status so the settings
+		// screen doesn't show stale info after a manual edit.
+		m.settings.refreshShareHistStatus()
 		return m, nil
 	case tea.MouseMsg:
 		return m.updateMouse(msg)
@@ -91,6 +108,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		if m.viewer != nil {
 			return m.updateViewer(msg)
+		}
+		if m.settings != nil {
+			return m.updateSettings(msg)
 		}
 		if m.form != nil {
 			return m.updateForm(msg)
@@ -116,6 +136,9 @@ func (m model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.form != nil {
+		return m, nil
+	}
+	if m.settings != nil {
 		return m, nil
 	}
 	// List mode: wheel moves cursor, left click sets cursor on clicked row.
@@ -159,6 +182,9 @@ func (m model) View() string {
 	}
 	if m.viewer != nil {
 		return m.renderViewerView(w, h)
+	}
+	if m.settings != nil {
+		return m.renderSettingsView(w, h)
 	}
 	if m.form != nil {
 		return m.renderFormView(w, h)
@@ -255,10 +281,20 @@ func filepathDir(p string) string {
 }
 
 func main() {
-	var runFlag bool
-	flag.BoolVar(&runFlag, "r", false, "run the selected command directly instead of printing it to stdout")
-	flag.BoolVar(&runFlag, "run", false, "run the selected command directly instead of printing it to stdout")
+	// Default: mkm executes the selected command itself. --print restores
+	// the old stdout-only mode so the legacy zsh/bash wrapper in README
+	// keeps working. -r/--run are kept as no-op aliases — executing is now
+	// the default, but scripts that still pass the flag continue to work.
+	var printFlag, runFlag bool
+	flag.BoolVar(&printFlag, "p", false, "print the selected command to stdout instead of executing it (for the legacy shell wrapper)")
+	flag.BoolVar(&printFlag, "print", false, "print the selected command to stdout instead of executing it (for the legacy shell wrapper)")
+	flag.BoolVar(&runFlag, "r", false, "run the selected command directly (now the default — kept for backward compat)")
+	flag.BoolVar(&runFlag, "run", false, "run the selected command directly (now the default — kept for backward compat)")
 	flag.Parse()
+	_ = runFlag // no-op: exec is already the default
+
+	cfg := loadConfig()
+	applyTheme(cfg.Theme)
 
 	allTargets, groups, err := collectTargets()
 	if err != nil {
@@ -280,7 +316,7 @@ func main() {
 	lipgloss.DefaultRenderer().SetColorProfile(termenv.TrueColor)
 
 	p := tea.NewProgram(
-		newModel(groups),
+		newModel(groups, cfg),
 		tea.WithInput(tty),
 		tea.WithOutput(tty),
 		tea.WithAltScreen(),
@@ -300,31 +336,40 @@ func main() {
 
 	var args []string
 	if finalModel.form != nil {
-		appendHistory(*finalModel.form.target)
+		if finalModel.writeHistory {
+			appendHistory(*finalModel.form.target)
+		}
 		args = makeCmd(*finalModel.form.target, finalModel.form.params, finalModel.form.values)
 	} else {
 		target := finalModel.flat[finalModel.filtered[finalModel.cursor]]
-		appendHistory(target)
+		if finalModel.writeHistory {
+			appendHistory(target)
+		}
 		args = makeCmd(target, nil, nil)
 	}
 
-	if runFlag {
-		// Exec the make command directly, wiring std streams so the user sees
-		// output like a normal `make` invocation.
-		c := exec.Command(args[0], args[1:]...)
-		c.Stdin = os.Stdin
-		c.Stdout = os.Stdout
-		c.Stderr = os.Stderr
-		if err := c.Run(); err != nil {
-			if exitErr, ok := err.(*exec.ExitError); ok {
-				os.Exit(exitErr.ExitCode())
-			}
-			fmt.Fprintln(os.Stderr, err)
-			os.Exit(1)
-		}
+	if printFlag {
+		// Print mode: emit the command for the legacy wrapper to eval.
+		// Shell-history recording is the wrapper's responsibility here.
+		fmt.Println(strings.Join(args, " "))
 		return
 	}
 
-	// Default: print the command so the shell wrapper can eval it.
-	fmt.Println(strings.Join(args, " "))
+	// Default: exec the make command directly, wiring std streams so the
+	// user sees output like a normal `make` invocation. Optionally append
+	// the command to $HISTFILE so up-arrow in future shells recalls it.
+	if finalModel.shellHistory {
+		appendShellHistory(strings.Join(args, " "))
+	}
+	c := exec.Command(args[0], args[1:]...)
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	if err := c.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }

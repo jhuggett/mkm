@@ -38,6 +38,18 @@ func (m model) newViewerState(target MakeTarget) *viewerState {
 	return v
 }
 
+// newViewerStateForPath returns a viewer for an arbitrary file (no
+// associated MakeTarget). targetLines is left empty, so next/prev-target
+// navigation is a no-op — fine for rc-file browsing. Returns nil on read
+// failure so callers can stay on the previous screen.
+func (m model) newViewerStateForPath(path string) *viewerState {
+	v := &viewerState{path: path}
+	if err := v.reload(m.flat); err != nil {
+		return nil
+	}
+	return v
+}
+
 // reload re-reads the file from disk and recomputes target-line positions
 // from the given flat target list. Used after $EDITOR modifies the file.
 func (v *viewerState) reload(flat []MakeTarget) error {
