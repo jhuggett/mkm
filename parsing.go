@@ -26,6 +26,7 @@ type MakeTarget struct {
 	Params       []MakeParam
 	File         string // path to the Makefile (relative to cwd)
 	Line         int    // 1-based line number of the target definition
+	Phony        bool   // declared in a .PHONY: list in the same file
 	// Annotation flags computed once after parsing (see annotateTargets).
 	HasParams   bool // has its own @param or references a file-level @param
 	HasScaffold bool // has $(VAR) refs not covered by @param or file assignments
@@ -173,6 +174,7 @@ func parseMakefileTargets(makefilePath string) ([]MakeTarget, []MakeParam, error
 	var commentBuf []string
 	var paramBuf []MakeParam
 	var current *MakeTarget
+	phony := map[string]bool{}
 
 	// promoteParams flushes paramBuf into fileParams. Called whenever a
 	// comment block ends without being claimed by a target definition —
@@ -206,8 +208,16 @@ func parseMakefileTargets(makefilePath string) ([]MakeTarget, []MakeParam, error
 			continue
 		}
 
-		// .PHONY does NOT clear comment buffer (comment → .PHONY → target is common)
+		// .PHONY does NOT clear comment buffer (comment → .PHONY → target is common).
+		// Collect declared names so we can flag the matching targets — having
+		// `Phony` on the target lets the UI distinguish action recipes from
+		// file-producing rules without re-scanning the source.
 		if strings.HasPrefix(trimmed, ".PHONY") {
+			rest := strings.TrimSpace(strings.TrimPrefix(trimmed, ".PHONY"))
+			rest = strings.TrimPrefix(rest, ":")
+			for _, name := range strings.Fields(rest) {
+				phony[name] = true
+			}
 			continue
 		}
 
@@ -292,6 +302,13 @@ func parseMakefileTargets(makefilePath string) ([]MakeTarget, []MakeParam, error
 		return nil, nil, err
 	}
 	promoteParams() // flush any trailing unattached @params at EOF
+	// Stamp Phony post-hoc: a .PHONY: line can appear before or after the
+	// rule itself, so we resolve in a single pass after collecting both.
+	for i := range targets {
+		if phony[targets[i].Name] {
+			targets[i].Phony = true
+		}
+	}
 	return targets, fileParams, nil
 }
 

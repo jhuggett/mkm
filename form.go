@@ -11,10 +11,12 @@ import (
 // applicable @param annotations (its own and/or referenced file-level).
 // nil on model means we're in list/filter mode.
 type formState struct {
-	target *MakeTarget
-	params []MakeParam // effective params: target-level + referenced file-level
-	values map[string]string
-	focus  int
+	target    *MakeTarget
+	params    []MakeParam // effective params: target-level + referenced file-level
+	values    map[string]string
+	focus     int
+	errMsg    string // transient validation feedback shown above the legend
+	errMsgSeq int
 }
 
 func newFormState(target *MakeTarget, params []MakeParam) *formState {
@@ -43,6 +45,27 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.form = nil
 		return m, nil
 	case "enter":
+		// Block running until every required param has a value. Without
+		// this the * indicator was a lie — make would be invoked with
+		// blank VAR= args and the recipe would silently misbehave.
+		var missing []string
+		for _, p := range m.form.params {
+			if p.Required && strings.TrimSpace(m.form.values[p.Name]) == "" {
+				missing = append(missing, p.Name)
+			}
+		}
+		if len(missing) > 0 {
+			// Park focus on the first missing param so the user can fix it.
+			for i, p := range m.form.params {
+				if p.Name == missing[0] {
+					m.form.focus = i
+					break
+				}
+			}
+			m.form.errMsg = "missing required: " + strings.Join(missing, ", ")
+			m.form.errMsgSeq++
+			return m, clearToastCmd(toastFormErr, m.form.errMsgSeq)
+		}
 		m.selected = true
 		return m, tea.Quit
 	case "down", "tab":
@@ -58,11 +81,17 @@ func (m model) updateForm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch p.Kind {
 	case "enum":
-		switch key {
-		case "left", "h":
+		switch {
+		case key == "left" || key == "h":
 			m.form.values[p.Name] = cycleEnum(p.Options, v, -1)
-		case "right", "l", " ":
+		case key == "right" || key == "l" || key == " ":
 			m.form.values[p.Name] = cycleEnum(p.Options, v, 1)
+		case len(key) == 1 && key[0] >= 'a' && key[0] <= 'z':
+			// Type-ahead: same behavior as the settings theme row.
+			// Wraps so a repeated press cycles through matches.
+			if name := nextByPrefix(p.Options, v, key); name != "" {
+				m.form.values[p.Name] = name
+			}
 		}
 	case "bool":
 		if key == " " || key == "left" || key == "right" {
@@ -104,66 +133,50 @@ func cycleEnum(options []string, current string, delta int) string {
 	return options[idx]
 }
 
-func (m model) renderFormHelpKeys() string {
-	gap := ruleStyle.Render("  ")
-	segs := []string{
-		helpKeyStyle.Render("↑↓"),
-		helpKeyStyle.Render("←→"),
-		helpKeyStyle.Render("enter:run"),
-		helpKeyStyle.Render("esc:back"),
-	}
-	return strings.Join(segs, gap)
+func (m model) renderFormLegend(w int) string {
+	return renderLegend(w, []legendItem{
+		{Key: "↑↓"},
+		{Key: "←→/space", Hint: "cycle/toggle"},
+		{Key: "type", Hint: "edit"},
+		{Key: "^u", Hint: "clear"},
+		{Key: "enter", Hint: "run"},
+		{Key: "esc", Hint: "back"},
+	})
 }
 
 // renderFormTopLine is like renderTopLine but the "filter" slot shows the
-// target name and help keys are form-specific.
+// target name. Help moved to the bottom legend row.
 func (m model) renderFormTopLine(w int) string {
 	left := titleStyle.Render("mkm") + filterPromptStyle.Render(" › ")
 	leftW := lipgloss.Width(left)
 
-	help := m.renderFormHelpKeys()
-	helpW := lipgloss.Width(help)
-
-	gap := 2
-	avail := w - leftW - helpW - gap
+	avail := w - leftW
 	if avail < 0 {
-		help = ""
-		helpW = 0
-		avail = w - leftW
-		if avail < 0 {
-			avail = 0
-		}
+		avail = 0
 	}
-
 	name := m.form.target.Name
 	if len(name) > avail {
 		name = truncateStr(name, avail)
 	}
-	namePart := filterStyle.Render(name)
-	nameW := lipgloss.Width(namePart)
-
-	pad := w - leftW - nameW - helpW
-	if pad < 0 {
-		pad = 0
-	}
-	return left + namePart + strings.Repeat(" ", pad) + help
+	return padLine(left+filterStyle.Render(name), w)
 }
 
-// renderFormView renders the param-input form: top line + rule + form body +
-// rule + live-updating command preview at the bottom.
+// renderFormView renders the param-input form: top + rule + body + rule +
+// command preview + legend.
 func (m model) renderFormView(w, h int) string {
 	top := m.renderFormTopLine(w)
 	rule := ruleStyle.Render(strings.Repeat("─", w))
 	cmdPreview := m.renderFormCmd(w)
+	legend := m.renderFormLegend(w)
 
-	// Top(1) + rule(1) + rule-before-cmd(1) + cmd(1) = 4 fixed rows.
-	bodyH := h - 4
+	// top(1) + rule(1) + rule(1) + cmd(1) + legend(1) = 5 fixed rows.
+	bodyH := h - 5
 	if bodyH < 1 {
 		bodyH = 1
 	}
 	body := m.renderFormBody(w, bodyH)
 
-	return strings.Join([]string{top, rule, body, rule, cmdPreview}, "\n")
+	return strings.Join([]string{top, rule, body, rule, cmdPreview, legend}, "\n")
 }
 
 func (m model) renderFormBody(w, h int) string {
@@ -232,7 +245,9 @@ func (m model) renderParamRow(p MakeParam, value string, nameW, w int, focused b
 
 	trailing := ""
 	if p.Description != "" {
-		trailing = "  " + noMatchStyle.Render(p.Description)
+		// Same dim style used for target descriptions in the list — keeps
+		// "metadata about this thing" visually consistent across pages.
+		trailing = "  " + helpKeyStyle.Render(p.Description)
 	}
 	requiredMark := ""
 	if p.Required {
@@ -295,16 +310,14 @@ func renderTextValue(value string, focused bool, maxLen int) string {
 }
 
 func (m model) renderFormCmd(w int) string {
-	args := makeCmd(*m.form.target, m.form.params, m.form.values)
-	cmd := strings.Join(args, " ")
-	prefix := filterPromptStyle.Render("$ ")
-	body := recipeStyle.Render(truncateStr(cmd, w-2))
-	line := prefix + body
-	lw := lipgloss.Width(line)
-	if lw < w {
-		line += strings.Repeat(" ", w-lw)
+	if m.form.errMsg != "" {
+		// Red pill makes the failed enter unmistakable.
+		pill := renderActionPill("!", "fix", redColor)
+		return renderActionLine(w, pill, diffRemoveStyle.Render(m.form.errMsg))
 	}
-	return line
+	args := makeCmd(*m.form.target, m.form.params, m.form.values)
+	pill := renderActionPill("⏎", "run", accent)
+	return renderActionLine(w, pill, renderMakeCmd(args))
 }
 
 // makeCmd builds the argv to run for `target` given param `values`. The

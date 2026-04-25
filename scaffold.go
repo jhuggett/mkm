@@ -94,6 +94,8 @@ type scaffoldState struct {
 	edits       []scaffoldParamEdit
 	focus       int    // -1 = description row, 0..N-1 = edits[focus]
 	field       string // for description "text"; for edits, one of visibleFields()
+	errMsg      string // transient feedback above the legend (write errors / no-op)
+	errMsgSeq   int
 }
 
 func (m model) newScaffoldState(target MakeTarget) *scaffoldState {
@@ -315,7 +317,9 @@ func setFieldText(e *scaffoldParamEdit, field, value string) {
 
 // commitScaffold rewrites the target's comment block: description line(s)
 // plus @param lines, preserving any adjacent .PHONY marker. Unnamed rows
-// are skipped.
+// are skipped. Refuses to write a no-op (no description + no named
+// params) when there's an existing block too — that would be a delete,
+// which the user should opt into explicitly via ^d on rows.
 func (m model) commitScaffold(openEditor bool) (tea.Model, tea.Cmd) {
 	s := m.scaffold
 	committable := committableEdits(s.edits)
@@ -327,9 +331,17 @@ func (m model) commitScaffold(openEditor bool) (tea.Model, tea.Cmd) {
 	if strings.TrimSpace(s.description) != "" {
 		descLines = []string{"# " + strings.TrimSpace(s.description)}
 	}
+	if len(descLines) == 0 && len(paramLines) == 0 {
+		// Nothing committable. If there's no existing block either, this
+		// is a true no-op — surface that instead of silently closing.
+		if !hasOldBlock(s.target) {
+			return m.toastScaffoldErr("nothing to write — name at least one param row or set the description")
+		}
+		// Falls through: existing block + empty new = explicit delete.
+	}
 	newLine, err := rewriteTargetBlock(s.target, descLines, paramLines)
 	if err != nil {
-		return m, nil
+		return m.toastScaffoldErr("write failed: " + err.Error())
 	}
 	path := s.target.File
 	m.scaffold = nil
@@ -337,6 +349,14 @@ func (m model) commitScaffold(openEditor bool) (tea.Model, tea.Cmd) {
 		return m, editCmd(path, newLine)
 	}
 	return m, nil
+}
+
+// toastScaffoldErr sets a transient error message on the scaffold page
+// and schedules its clearing.
+func (m model) toastScaffoldErr(text string) (tea.Model, tea.Cmd) {
+	m.scaffold.errMsg = text
+	m.scaffold.errMsgSeq++
+	return m, clearToastCmd(toastScafErr, m.scaffold.errMsgSeq)
 }
 
 // rewriteTargetBlock replaces the comment block immediately above `target`
@@ -411,9 +431,10 @@ func rewriteTargetBlock(target MakeTarget, descLines, paramLines []string) (int,
 func (m model) renderScaffoldView(w, h int) string {
 	top := m.renderScaffoldTopLine(w)
 	rule := ruleStyle.Render(strings.Repeat("─", w))
-	footer := m.renderScaffoldFooter(w)
-	body := m.renderScaffoldBody(w, h-4)
-	return strings.Join([]string{top, rule, body, rule, footer}, "\n")
+	cmd := m.renderScaffoldCmdLine(w)
+	legend := m.renderScaffoldLegend(w)
+	body := m.renderScaffoldBody(w, h-5)
+	return strings.Join([]string{top, rule, body, rule, cmd, legend}, "\n")
 }
 
 func (m model) renderScaffoldTopLine(w int) string {
@@ -428,22 +449,48 @@ func (m model) renderScaffoldTopLine(w int) string {
 	return left + strings.Repeat(" ", pad) + right + "  "
 }
 
-func (m model) renderScaffoldFooter(w int) string {
-	parts := []string{
-		helpKeyStyle.Render("tab/↑↓") + normalItemStyle.Render(": field"),
-		helpKeyStyle.Render("←→/space") + normalItemStyle.Render(": cycle/toggle"),
-		helpKeyStyle.Render("^n") + normalItemStyle.Render(": add"),
-		helpKeyStyle.Render("^d") + normalItemStyle.Render(": delete"),
-		helpKeyStyle.Render("enter") + normalItemStyle.Render(": write"),
-		helpKeyStyle.Render("^e") + normalItemStyle.Render(": write + edit"),
-		helpKeyStyle.Render("esc") + normalItemStyle.Render(": cancel"),
+func (m model) renderScaffoldLegend(w int) string {
+	return renderLegend(w, []legendItem{
+		{Key: "↑↓/tab", Hint: "field"},
+		{Key: "←→/space", Hint: "cycle/toggle"},
+		{Key: "^n", Hint: "add"},
+		{Key: "^d", Hint: "delete"},
+		{Key: "enter", Hint: "write"},
+		{Key: "^e", Hint: "write+edit"},
+		{Key: "esc", Hint: "cancel"},
+	})
+}
+
+// renderScaffoldCmdLine describes the file mutation enter would commit:
+// the target file and a summary of the change (N @param lines + optional
+// description). When a transient error is set, that takes precedence so
+// the user can see why their last enter didn't apply.
+func (m model) renderScaffoldCmdLine(w int) string {
+	s := m.scaffold
+	if s.errMsg != "" {
+		pill := renderActionPill("!", "fail", redColor)
+		return renderActionLine(w, pill, diffRemoveStyle.Render(s.errMsg))
 	}
-	line := "  " + strings.Join(parts, ruleStyle.Render("   "))
-	lw := lipgloss.Width(line)
-	if lw < w {
-		line += strings.Repeat(" ", w-lw)
+	committable := committableEdits(s.edits)
+	descKept := strings.TrimSpace(s.description) != ""
+	parts := []string{}
+	if descKept {
+		parts = append(parts, "description")
 	}
-	return line
+	if n := len(committable); n > 0 {
+		if n == 1 {
+			parts = append(parts, "1 @param")
+		} else {
+			parts = append(parts, fmt.Sprintf("%d @params", n))
+		}
+	}
+	summary := normalItemStyle.Render("no changes pending")
+	if len(parts) > 0 {
+		summary = depsLabelStyle.Render(strings.Join(parts, " + "))
+	}
+	body := summary + normalItemStyle.Render(" → ") + selectedItemStyle.Render(s.target.File)
+	pill := renderActionPill("⏎", "write", greenColor)
+	return renderActionLine(w, pill, body)
 }
 
 func (m model) renderScaffoldBody(w, h int) string {
@@ -488,7 +535,7 @@ func (m model) renderScaffoldBody(w, h int) string {
 		diff := buildBlockDiff(s.target, descPreview, paramPreview, 2, 2)
 		lines = append(lines, renderDiffLines(diff, w)...)
 	} else if len(s.edits) > 0 {
-		lines = append(lines, "  "+noMatchStyle.Render("Diff: set a name on at least one row to see what will change."))
+		lines = append(lines, "  "+noMatchStyle.Render("Diff: name a row or set a description to see what will change."))
 	}
 
 	if len(lines) > h {

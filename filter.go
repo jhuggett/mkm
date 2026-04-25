@@ -111,7 +111,17 @@ func (m *model) updateFilter() {
 			if t.Dir != "." {
 				label = t.Dir + "/" + t.Name
 			}
+			// Score against the target name first; fall back to the
+			// description with a discount so name hits always outrank
+			// description hits. Lets users find a target by what it
+			// does ("docker") even when the target name is opaque.
 			s, ok := fuzzyScore(label, m.filter)
+			if !ok && t.Description != "" {
+				if ds, dok := fuzzyScore(t.Description, m.filter); dok {
+					s = ds/2 - 5
+					ok = true
+				}
+			}
 			if !ok {
 				continue
 			}

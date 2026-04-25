@@ -186,17 +186,16 @@ func (m *model) clampViewer() {
 }
 
 func (m model) viewerBodyHeight() int {
-	// top(1) + rule(1) + rule(1) + status(1) = 4 fixed rows
-	h := m.height - 4
+	// top(1) + rule(1) + rule(1) + cmd(1) + legend(1) = 5 fixed rows
+	h := m.height - 5
 	if h < 1 {
 		h = 1
 	}
 	return h
 }
 
-// renderViewerView renders the in-TUI Makefile viewer. Top line shows the
-// path + viewer-specific help keys, the body shows source with line numbers
-// and light syntax styling, and the footer shows position + key hints.
+// renderViewerView renders the in-TUI Makefile viewer: top + rule + body +
+// rule + cmd line (what `e` would run) + legend.
 func (m model) renderViewerView(w, h int) string {
 	v := m.viewer
 	top := m.renderViewerTopLine(w)
@@ -204,42 +203,70 @@ func (m model) renderViewerView(w, h int) string {
 
 	bodyH := m.viewerBodyHeight()
 	body := renderViewerBody(v, w, bodyH)
-	footer := renderViewerFooter(v, w)
+	cmd := m.renderViewerCmdLine(w)
+	legend := m.renderViewerLegend(w)
 
-	return strings.Join([]string{top, rule, body, rule, footer}, "\n")
+	return strings.Join([]string{top, rule, body, rule, cmd, legend}, "\n")
 }
 
 func (m model) renderViewerTopLine(w int) string {
 	left := titleStyle.Render("mkm") + filterPromptStyle.Render(" › ")
-	path := m.viewer.path
-	help := strings.Join([]string{
-		helpKeyStyle.Render("↑↓ jk"),
-		helpKeyStyle.Render("n/N:target"),
-		helpKeyStyle.Render("e:edit"),
-		helpKeyStyle.Render("esc:back"),
-	}, ruleStyle.Render("  "))
 	leftW := lipgloss.Width(left)
-	helpW := lipgloss.Width(help)
-
-	avail := w - leftW - helpW - 2
+	avail := w - leftW
 	if avail < 1 {
-		help = ""
-		helpW = 0
-		avail = w - leftW
-		if avail < 1 {
-			avail = 1
-		}
+		avail = 1
 	}
-	if len(path) > avail {
-		path = truncateStr(path, avail)
+
+	v := m.viewer
+	pos := fmt.Sprintf("  line %d/%d", v.cursor+1, len(v.lines))
+	if len(v.lines) > 1 {
+		pos += fmt.Sprintf(" (%d%%)", (v.cursor*100)/(len(v.lines)-1))
+	}
+	posW := lipgloss.Width(pos)
+	pathAvail := avail - posW
+	if pathAvail < 1 {
+		pathAvail = 1
+	}
+	path := v.path
+	if len(path) > pathAvail {
+		path = truncateStr(path, pathAvail)
 	}
 	pathPart := filterStyle.Render(path)
 	pathW := lipgloss.Width(pathPart)
-	pad := w - leftW - pathW - helpW
+	pad := w - leftW - pathW - posW
 	if pad < 0 {
 		pad = 0
 	}
-	return left + pathPart + strings.Repeat(" ", pad) + help
+	return left + pathPart + strings.Repeat(" ", pad) + helpKeyStyle.Render(pos)
+}
+
+func (m model) renderViewerLegend(w int) string {
+	return renderLegend(w, []legendItem{
+		{Key: "↑↓/jk"},
+		{Key: "g/G", Hint: "top/bot"},
+		{Key: "n/N", Hint: "target"},
+		{Key: "^d/^u", Hint: "½ page"},
+		{Key: "e", Hint: "edit"},
+		{Key: "^g", Hint: "help"},
+		{Key: "esc", Hint: "back"},
+	})
+}
+
+// renderViewerCmdLine shows what `e` would run — the editor invocation for
+// the current line. Mirrors the format the viewer would actually exec so
+// the user can see exactly where they'd land. Cyan pill keeps it visually
+// distinct from the accent-colored "run" actions on other pages.
+func (m model) renderViewerCmdLine(w int) string {
+	v := m.viewer
+	editor := os.Getenv("EDITOR")
+	if editor == "" {
+		editor = "vi"
+	}
+	body := helpKeyStyle.Render(editor) + " " +
+		depsLabelStyle.Render(fmt.Sprintf("+%d", v.cursor+1)) + " " +
+		selectedItemStyle.Render(v.path)
+	pill := renderActionPill("✎", "edit", cyanColor)
+	return renderActionLine(w, pill, body)
 }
 
 // renderViewerBody returns exactly h rows of the viewer body: line numbers
@@ -325,28 +352,3 @@ func styleMakefileLine(line string, maxW int) string {
 	return normalItemStyle.Render(truncateStr(line, maxW))
 }
 
-func renderViewerFooter(v *viewerState, w int) string {
-	pos := fmt.Sprintf("line %d/%d", v.cursor+1, len(v.lines))
-	pct := "--"
-	if len(v.lines) > 1 {
-		pct = fmt.Sprintf("%d%%", (v.cursor*100)/(len(v.lines)-1))
-	}
-	left := helpKeyStyle.Render(pos) +
-		ruleStyle.Render("  ") +
-		helpKeyStyle.Render(pct)
-	right := helpKeyStyle.Render("g/G  n/N  ctrl+d/u  e  esc")
-
-	leftW := lipgloss.Width(left)
-	rightW := lipgloss.Width(right)
-	pad := w - leftW - rightW
-	if pad < 0 {
-		pad = 0
-		right = ""
-		rightW = 0
-		pad = w - leftW
-		if pad < 0 {
-			pad = 0
-		}
-	}
-	return left + strings.Repeat(" ", pad) + right
-}

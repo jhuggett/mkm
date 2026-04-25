@@ -169,6 +169,7 @@ var (
 	selectedItemStyle   lipgloss.Style
 	selectedCursorStyle lipgloss.Style
 	normalItemStyle     lipgloss.Style
+	recentItemStyle     lipgloss.Style // unselected target run within ~24h
 	matchStyle          lipgloss.Style
 	helpKeyStyle        lipgloss.Style
 	ruleStyle           lipgloss.Style
@@ -213,6 +214,7 @@ func applyTheme(name string) {
 	selectedItemStyle = lipgloss.NewStyle().Foreground(hiColor).Bold(true)
 	selectedCursorStyle = lipgloss.NewStyle().Foreground(accent).Bold(true)
 	normalItemStyle = lipgloss.NewStyle().Foreground(textColor)
+	recentItemStyle = lipgloss.NewStyle().Foreground(hiColor)
 	matchStyle = lipgloss.NewStyle().Foreground(accent)
 	helpKeyStyle = lipgloss.NewStyle().Foreground(dimColor)
 	ruleStyle = lipgloss.NewStyle().Foreground(subtleColor)

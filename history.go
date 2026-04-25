@@ -125,6 +125,29 @@ func historyKey(t MakeTarget) string {
 	return t.Dir + "\x00" + t.Name
 }
 
+// lastHistoryEntry returns (dir, name) of the most-recently-recorded
+// target, or ("", "", false) if the history file is missing or empty.
+// Powers `mkm --last` for one-keystroke reruns of the previous target.
+func lastHistoryEntry() (string, string, bool) {
+	h := loadHistory()
+	if len(h) == 0 {
+		return "", "", false
+	}
+	var bestKey string
+	var bestTs int64
+	for k, ts := range h {
+		if ts > bestTs {
+			bestTs = ts
+			bestKey = k
+		}
+	}
+	parts := strings.SplitN(bestKey, "\x00", 2)
+	if len(parts) != 2 {
+		return "", "", false
+	}
+	return parts[0], parts[1], true
+}
+
 // recencyBonus returns a score bump for targets used recently. Decays in
 // coarse steps so the "freshness" signal is noticeable but doesn't drown
 // out a better fuzzy match on an older target.

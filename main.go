@@ -6,11 +6,55 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
 	termenv "github.com/muesli/termenv"
 )
+
+// toastKind identifies which transient string a toastClearMsg targets.
+// Kept narrow — toasts that share a kind clobber each other (intended).
+type toastKind int
+
+const (
+	toastUpdate toastKind = iota // model.updateMsg ("copied", "copy failed")
+	toastClip                    // settingsState.clipMsg
+	toastSaved                   // model.savedMsg ("config saved")
+	toastFormErr                 // formState.errMsg ("missing required: ...")
+	toastScafErr                 // scaffoldState.errMsg
+)
+
+// toastClearMsg fires after toastDuration and clears the named toast iff
+// its sequence number still matches the latest set — so fast successive
+// toasts don't get pre-cleared by an older tick.
+type toastClearMsg struct {
+	kind toastKind
+	seq  int
+}
+
+const toastDuration = 2 * time.Second
+
+func clearToastCmd(kind toastKind, seq int) tea.Cmd {
+	return tea.Tick(toastDuration, func(time.Time) tea.Msg {
+		return toastClearMsg{kind: kind, seq: seq}
+	})
+}
+
+// toastUpdate sets the update-banner toast (e.g. "copied: ...") and
+// schedules its clearing.
+func (m model) toastUpdate(text string) (tea.Model, tea.Cmd) {
+	m.updateMsg = text
+	m.updateMsgSeq++
+	return m, clearToastCmd(toastUpdate, m.updateMsgSeq)
+}
+
+// toastSaved sets the cmdline "config saved" toast on the list page.
+func (m model) toastSaved(text string) (tea.Model, tea.Cmd) {
+	m.savedMsg = text
+	m.savedMsgSeq++
+	return m, clearToastCmd(toastSaved, m.savedMsgSeq)
+}
 
 type model struct {
 	groups       []TargetGroup
@@ -31,9 +75,14 @@ type model struct {
 	writeHistory bool
 	shellHistory bool
 	checkUpdates bool
-	updateInfo   updateInfo
-	updateMsg    string // transient feedback after ctrl+u, cleared on next key
-	layout       *listLayoutCache
+	updateInfo    updateInfo
+	updateMsg     string // transient feedback after ctrl+u
+	updateMsgSeq  int
+	bannerHidden  bool   // true after ^x dismisses the update banner this session
+	savedMsg      string // transient "config saved" toast on the list cmdline
+	savedMsgSeq   int
+	helpScroll    int // top visible row of the help cheatsheet
+	layout        *listLayoutCache
 }
 
 func newModel(groups []TargetGroup, cfg Config) model {
@@ -88,6 +137,30 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case updateCheckMsg:
 		m.updateInfo = msg.info
 		return m, nil
+	case toastClearMsg:
+		switch msg.kind {
+		case toastUpdate:
+			if msg.seq == m.updateMsgSeq {
+				m.updateMsg = ""
+			}
+		case toastSaved:
+			if msg.seq == m.savedMsgSeq {
+				m.savedMsg = ""
+			}
+		case toastClip:
+			if m.settings != nil && msg.seq == m.settings.clipMsgSeq {
+				m.settings.clipMsg = ""
+			}
+		case toastFormErr:
+			if m.form != nil && msg.seq == m.form.errMsgSeq {
+				m.form.errMsg = ""
+			}
+		case toastScafErr:
+			if m.scaffold != nil && msg.seq == m.scaffold.errMsgSeq {
+				m.scaffold.errMsg = ""
+			}
+		}
+		return m, nil
 	case editorFinishedMsg:
 		// Editor may have modified the Makefile; re-parse to pick up changes.
 		if flat, groups, err := collectTargets(); err == nil {
@@ -110,11 +183,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateMouse(msg)
 	case tea.KeyMsg:
 		if m.showHelp {
-			if msg.String() == "ctrl+c" {
-				return m, tea.Quit
-			}
-			m.showHelp = false
-			return m, nil
+			return m.updateHelp(msg)
 		}
 		if m.scaffold != nil {
 			return m.updateScaffold(msg)
@@ -149,9 +218,30 @@ func (m model) updateMouse(msg tea.MouseMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	if m.form != nil {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.form.focus = (m.form.focus - 1 + len(m.form.params)) % len(m.form.params)
+		case tea.MouseButtonWheelDown:
+			m.form.focus = (m.form.focus + 1) % len(m.form.params)
+		}
 		return m, nil
 	}
 	if m.settings != nil {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.settings.focus = (m.settings.focus - 1 + settingsFieldCount) % settingsFieldCount
+		case tea.MouseButtonWheelDown:
+			m.settings.focus = (m.settings.focus + 1) % settingsFieldCount
+		}
+		return m, nil
+	}
+	if m.scaffold != nil {
+		switch msg.Button {
+		case tea.MouseButtonWheelUp:
+			m.scaffold.advance(-1)
+		case tea.MouseButtonWheelDown:
+			m.scaffold.advance(1)
+		}
 		return m, nil
 	}
 	// List mode: wheel moves cursor, left click sets cursor on clicked row.
@@ -206,6 +296,8 @@ func (m model) View() string {
 	top := m.renderTopLine(w)
 	rule := ruleStyle.Render(strings.Repeat("─", w))
 	banner := m.renderUpdateBanner(w)
+	cmdLine := m.renderListCmdLine(w)
+	legend := m.renderListLegend(w)
 
 	// Banner (when present) sits between the top line and the rule; its
 	// row shifts the list body down by one and eats into the available
@@ -215,12 +307,15 @@ func (m model) View() string {
 		bannerRows = 1
 	}
 
-	remain := h - 2 - bannerRows
+	// Fixed bottom strip: rule + cmdline + legend.
+	fixed := 2 + bannerRows + 3
+	remain := h - fixed
 	if remain < 1 {
+		// Degraded: just show the top + rule + legend so we still have key hints.
 		if banner != "" {
-			return top + "\n" + banner + "\n" + rule
+			return strings.Join([]string{top, banner, rule, legend}, "\n")
 		}
-		return top + "\n" + rule
+		return strings.Join([]string{top, rule, legend}, "\n")
 	}
 
 	var parts []string
@@ -248,11 +343,58 @@ func (m model) View() string {
 		parts = append(parts, m.renderTargetList(w, listH))
 		parts = append(parts, rule)
 		parts = append(parts, renderInlinePreview(target, w, previewH))
-		return strings.Join(parts, "\n")
+	} else {
+		parts = append(parts, m.renderTargetList(w, remain))
 	}
 
-	parts = append(parts, m.renderTargetList(w, remain))
+	parts = append(parts, rule, cmdLine, legend)
 	return strings.Join(parts, "\n")
+}
+
+// runLastTarget resolves the most-recent history entry against the
+// freshly-parsed target list and runs it without showing the TUI.
+// Designed for `mkm --last`: muscle memory for "do the same thing
+// again". Exits non-zero if there's no history or the recorded target
+// no longer exists in the cwd.
+func runLastTarget(allTargets []MakeTarget, cfg Config, printFlag bool) {
+	dir, name, ok := lastHistoryEntry()
+	if !ok {
+		fmt.Fprintln(os.Stderr, "mkm --last: no history recorded yet — run a target normally first.")
+		os.Exit(1)
+	}
+	var target *MakeTarget
+	for i := range allTargets {
+		if allTargets[i].Dir == dir && allTargets[i].Name == name {
+			target = &allTargets[i]
+			break
+		}
+	}
+	if target == nil {
+		fmt.Fprintf(os.Stderr, "mkm --last: previous target %q in %q is no longer present.\n", name, dir)
+		os.Exit(1)
+	}
+	if cfg.WriteHistory {
+		appendHistory(*target)
+	}
+	args := makeCmd(*target, nil, nil)
+	if printFlag {
+		fmt.Println(strings.Join(args, " "))
+		return
+	}
+	if cfg.ShellHistory {
+		appendShellHistory(strings.Join(args, " "))
+	}
+	c := exec.Command(args[0], args[1:]...)
+	c.Stdin = os.Stdin
+	c.Stdout = os.Stdout
+	c.Stderr = os.Stderr
+	if err := c.Run(); err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			os.Exit(exitErr.ExitCode())
+		}
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 }
 
 // collectTargets walks the cwd for Makefiles, parses each, and returns the
@@ -313,11 +455,12 @@ func main() {
 	// the old stdout-only mode so the legacy zsh/bash wrapper in README
 	// keeps working. -r/--run are kept as no-op aliases — executing is now
 	// the default, but scripts that still pass the flag continue to work.
-	var printFlag, runFlag bool
+	var printFlag, runFlag, lastFlag bool
 	flag.BoolVar(&printFlag, "p", false, "print the selected command to stdout instead of executing it (for the legacy shell wrapper)")
 	flag.BoolVar(&printFlag, "print", false, "print the selected command to stdout instead of executing it (for the legacy shell wrapper)")
 	flag.BoolVar(&runFlag, "r", false, "run the selected command directly (now the default — kept for backward compat)")
 	flag.BoolVar(&runFlag, "run", false, "run the selected command directly (now the default — kept for backward compat)")
+	flag.BoolVar(&lastFlag, "last", false, "skip the TUI and re-run the most recently recorded target")
 	flag.Parse()
 	_ = runFlag // no-op: exec is already the default
 
@@ -332,6 +475,11 @@ func main() {
 	if len(allTargets) == 0 {
 		fmt.Fprintln(os.Stderr, "No Makefile targets found.")
 		os.Exit(1)
+	}
+
+	if lastFlag {
+		runLastTarget(allTargets, cfg, printFlag)
+		return
 	}
 
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)

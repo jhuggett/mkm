@@ -31,6 +31,7 @@ type settingsState struct {
 	shareHistApplied    bool   // true after we wrote the snippet in this session
 	shareHistErr        string
 	clipMsg             string // transient feedback after a ctrl+y copy attempt
+	clipMsgSeq          int
 }
 
 const (
@@ -59,10 +60,6 @@ func newSettingsState(cfg Config) *settingsState {
 
 func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	key := msg.String()
-	// Transient copy-to-clipboard feedback clears on the next keystroke.
-	if key != "ctrl+y" {
-		m.settings.clipMsg = ""
-	}
 	switch key {
 	case "ctrl+c":
 		return m, tea.Quit
@@ -95,7 +92,7 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.shellHistory = cfg.ShellHistory
 		m.checkUpdates = cfg.CheckUpdates
 		m.settings = nil
-		return m, nil
+		return m.toastSaved("config saved → " + configPath())
 	case "down", "tab":
 		m.settings.focus = (m.settings.focus + 1) % settingsFieldCount
 		return m, nil
@@ -106,13 +103,21 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	switch m.settings.focus {
 	case settingsFieldTheme:
-		switch key {
-		case "left", "h":
+		switch {
+		case key == "left" || key == "h":
 			m.settings.cfg.Theme = cycleEnum(m.settings.themes, m.settings.cfg.Theme, -1)
 			applyTheme(m.settings.cfg.Theme)
-		case "right", "l", " ":
+		case key == "right" || key == "l" || key == " ":
 			m.settings.cfg.Theme = cycleEnum(m.settings.themes, m.settings.cfg.Theme, 1)
 			applyTheme(m.settings.cfg.Theme)
+		case len(key) == 1 && key[0] >= 'a' && key[0] <= 'z':
+			// Type-ahead: jump to the next theme starting with this
+			// letter. Wraps around so repeated presses cycle through
+			// matches (e.g. 'g' → "github-dark" → "gruvbox-dark" → ...).
+			if name := nextByPrefix(m.settings.themes, m.settings.cfg.Theme, key); name != "" {
+				m.settings.cfg.Theme = name
+				applyTheme(name)
+			}
 		}
 	case settingsFieldWriteHistory:
 		if key == " " || key == "left" || key == "right" {
@@ -144,29 +149,33 @@ func (m model) updateSettings(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		case "ctrl+y":
 			snippet := strings.Trim(shareHistSnippet(m.settings.shareHistShell, m.settings.cfg.ShellHistory), "\n")
 			if snippet == "" {
-				m.settings.clipMsg = "no snippet available for this shell"
-				break
+				return m.toastClip("no snippet available for this shell")
 			}
 			if err := copyToClipboard(snippet); err != nil {
-				m.settings.clipMsg = "copy failed: " + err.Error()
-			} else {
-				m.settings.clipMsg = "snippet copied to clipboard"
+				return m.toastClip("copy failed: " + err.Error())
 			}
+			return m.toastClip("snippet copied to clipboard")
 		case "ctrl+r":
 			rc := rcFilePath(m.settings.shareHistShell)
 			if rc == "" {
-				m.settings.clipMsg = "no rc file for this shell"
-				break
+				return m.toastClip("no rc file for this shell")
 			}
 			cmd := "source " + abbreviateHome(rc)
 			if err := copyToClipboard(cmd); err != nil {
-				m.settings.clipMsg = "copy failed: " + err.Error()
-			} else {
-				m.settings.clipMsg = "copied: " + cmd
+				return m.toastClip("copy failed: " + err.Error())
 			}
+			return m.toastClip("copied: " + cmd)
 		}
 	}
 	return m, nil
+}
+
+// toastClip sets a transient clipboard-feedback message on the settings
+// page and returns a tea.Cmd that clears it after toastDuration.
+func (m model) toastClip(text string) (tea.Model, tea.Cmd) {
+	m.settings.clipMsg = text
+	m.settings.clipMsgSeq++
+	return m, clearToastCmd(toastClip, m.settings.clipMsgSeq)
 }
 
 // applyShareHistFromSettings runs the rc-file fix inline from the
@@ -215,59 +224,72 @@ func (s *settingsState) refreshShareHistStatus() {
 func (m model) renderSettingsView(w, h int) string {
 	top := m.renderSettingsTopLine(w)
 	rule := ruleStyle.Render(strings.Repeat("─", w))
+	cmd := m.renderSettingsCmdLine(w)
+	legend := m.renderSettingsLegend(w)
 
-	path := configPath()
-	if path == "" {
-		path = "(config path unavailable)"
-	}
-	footer := padLine(helpKeyStyle.Render(truncateStr("config file: "+path, w)), w)
-
-	bodyH := h - 4
+	bodyH := h - 5
 	if bodyH < 1 {
 		bodyH = 1
 	}
 	body := m.renderSettingsBody(w, bodyH)
-	return strings.Join([]string{top, rule, body, rule, footer}, "\n")
+	return strings.Join([]string{top, rule, body, rule, cmd, legend}, "\n")
 }
 
 func (m model) renderSettingsTopLine(w int) string {
 	left := titleStyle.Render("mkm") + filterPromptStyle.Render(" › ") + filterStyle.Render("settings")
-	help := m.renderSettingsHelpKeys()
-	pad := w - lipgloss.Width(left) - lipgloss.Width(help)
-	if pad < 0 {
-		pad = 0
-	}
-	return left + strings.Repeat(" ", pad) + help
+	return padLine(left, w)
 }
 
-func (m model) renderSettingsHelpKeys() string {
-	gap := ruleStyle.Render("  ")
-	segs := []string{
-		helpKeyStyle.Render("↑↓"),
-		helpKeyStyle.Render("←→"),
-		helpKeyStyle.Render("enter:save"),
-		helpKeyStyle.Render("esc:cancel"),
+func (m model) renderSettingsLegend(w int) string {
+	return renderLegend(w, []legendItem{
+		{Key: "↑↓"},
+		{Key: "←→/space", Hint: "cycle/toggle"},
+		{Key: "enter", Hint: "save"},
+		{Key: "esc", Hint: "cancel"},
+	})
+}
+
+// renderSettingsCmdLine describes the action enter would take — writing the
+// pending config back to disk. Surfaces the path so the user knows exactly
+// which file is being touched. Green pill cues "this commits a change."
+func (m model) renderSettingsCmdLine(w int) string {
+	path := configPath()
+	if path == "" {
+		path = "(config path unavailable)"
 	}
-	return strings.Join(segs, gap)
+	body := normalItemStyle.Render("config →") + " " + selectedItemStyle.Render(path)
+	pill := renderActionPill("⏎", "save", greenColor)
+	return renderActionLine(w, pill, body)
 }
 
 type settingsRow struct {
-	name  string
-	desc  string
-	value string
+	name    string
+	desc    string
+	value   string
+	section string // visual section label rendered above the first row in each group
+	extra   func() []string
 }
 
 func (m model) renderSettingsBody(w, h int) string {
 	rows := []settingsRow{
 		{
-			name:  "theme",
-			desc:  "color palette for the TUI",
-			value: renderCycleValue(m.settings.cfg.Theme, m.settings.focus == settingsFieldTheme),
+			section: "Display",
+			name:    "theme",
+			desc:    "color palette for the TUI",
+			value:   renderCycleValue(m.settings.cfg.Theme, themeIndex(m.settings.themes, m.settings.cfg.Theme)+1, len(m.settings.themes), m.settings.focus == settingsFieldTheme),
+			extra: func() []string {
+				// Color swatch under the theme row gives users a preview
+				// of what they're picking without cycling through all
+				// ten options. Uses the same accent colors the rest of
+				// the UI is built from, so the swatch is honest.
+				return []string{"      " + renderThemeSwatch()}
+			},
 		},
 		{
-			name:  "write_history",
-			desc:  "record selections to ~/.cache/mkm/history for recency ranking",
-			value: renderBoolValue(m.settings.cfg.WriteHistory),
+			section: "History",
+			name:    "write_history",
+			desc:    "record selections to ~/.cache/mkm/history for recency ranking",
+			value:   renderBoolValue(m.settings.cfg.WriteHistory),
 		},
 		{
 			name:  "shell_history",
@@ -275,9 +297,10 @@ func (m model) renderSettingsBody(w, h int) string {
 			value: renderBoolValue(m.settings.cfg.ShellHistory),
 		},
 		{
-			name:  "check_updates",
-			desc:  "check GitHub daily for a newer mkm release (result cached in ~/.cache/mkm)",
-			value: renderBoolValue(m.settings.cfg.CheckUpdates),
+			section: "Updates",
+			name:    "check_updates",
+			desc:    "check GitHub daily for a newer mkm release (result cached in ~/.cache/mkm)",
+			value:   renderBoolValue(m.settings.cfg.CheckUpdates),
 		},
 	}
 
@@ -289,8 +312,16 @@ func (m model) renderSettingsBody(w, h int) string {
 	}
 
 	var lines []string
-	lines = append(lines, "")
 	for i, r := range rows {
+		// Section header: shown above the first row of each group, with
+		// a separating blank line before it (unless it's the very top).
+		if r.section != "" {
+			if len(lines) > 0 {
+				lines = append(lines, "")
+			}
+			lines = append(lines, "  "+groupHeaderStyle.Render(r.section))
+			lines = append(lines, "")
+		}
 		cursor := "   "
 		if i == m.settings.focus {
 			cursor = selectedCursorStyle.Render(" › ")
@@ -302,6 +333,9 @@ func (m model) renderSettingsBody(w, h int) string {
 		avail := w - descIndentW
 		if r.desc != "" && avail > 0 {
 			lines = append(lines, strings.Repeat(" ", descIndentW)+noMatchStyle.Render(truncateStr(r.desc, avail)))
+		}
+		if r.extra != nil {
+			lines = append(lines, r.extra()...)
 		}
 
 		// shell_history row doubles as the rc-file integration control:
@@ -329,6 +363,19 @@ func (m model) renderSettingsBody(w, h int) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// renderThemeSwatch renders a row of small colored blocks using the
+// active theme's palette. Helps users see what a theme actually looks
+// like without cycling through every option to compare.
+func renderThemeSwatch() string {
+	block := "███ "
+	swatches := []lipgloss.Color{accent, cyanColor, greenColor, yellowColor, purpleColor, redColor}
+	var b strings.Builder
+	for _, c := range swatches {
+		b.WriteString(lipgloss.NewStyle().Foreground(c).Render(block))
+	}
+	return strings.TrimRight(b.String(), " ")
 }
 
 func renderBoolValue(on bool) string {
@@ -359,6 +406,14 @@ func (m model) renderShellHistStatusLines(w, indent int, focused bool) []string 
 	out = append(out, pad+shareHistStatusLine(s, avail))
 
 	if !focused {
+		// Even when unfocused, surface the most actionable key so the
+		// row doesn't feel inert. Only shown when there's something to
+		// do (not configured yet) — avoids advertising a no-op key on
+		// rows that are already set up.
+		if s.shareHistShell != "" && !s.shareHistConfigured {
+			hint := helpKeyStyle.Render("focus row → ") + helpKeyStyle.Render("^a") + helpKeyStyle.Render(" applies the wrapper")
+			out = append(out, pad+hint)
+		}
 		return out
 	}
 
@@ -559,22 +614,51 @@ func shellHistActionHints(s *settingsState) string {
 }
 
 // renderCycleValue is a compact alternative to renderEnumValue for fields
-// with many options — shows just the current value bracketed by arrows.
-func renderCycleValue(current string, focused bool) string {
+// with many options — shows just the current value bracketed by arrows
+// plus a `[N/M]` position so users can see how many options exist
+// without exhaustively cycling.
+func renderCycleValue(current string, idx, total int, focused bool) string {
+	pos := fmt.Sprintf("  [%d/%d]", idx, total)
 	if focused {
 		return selectedCursorStyle.Render("‹ ") +
 			selectedItemStyle.Render(current) +
-			selectedCursorStyle.Render(" ›")
+			selectedCursorStyle.Render(" ›") +
+			helpKeyStyle.Render(pos)
 	}
 	return noMatchStyle.Render("‹ ") +
 		normalItemStyle.Render(current) +
-		noMatchStyle.Render(" ›")
+		noMatchStyle.Render(" ›") +
+		helpKeyStyle.Render(pos)
 }
 
-func padLine(line string, w int) string {
-	lw := lipgloss.Width(line)
-	if lw < w {
-		return line + strings.Repeat(" ", w-lw)
+// themeIndex returns the 0-based index of `name` in `names` or 0 if not
+// found. Used purely for the position indicator.
+func themeIndex(names []string, name string) int {
+	for i, n := range names {
+		if n == name {
+			return i
+		}
 	}
-	return line
+	return 0
 }
+
+// nextByPrefix returns the next entry in `options` whose name starts with
+// `prefix`, beginning the search just past `current`. Wraps to the start
+// when needed. Returns "" if no entry matches.
+func nextByPrefix(options []string, current, prefix string) string {
+	start := 0
+	for i, o := range options {
+		if o == current {
+			start = i + 1
+			break
+		}
+	}
+	for i := 0; i < len(options); i++ {
+		o := options[(start+i)%len(options)]
+		if strings.HasPrefix(o, prefix) {
+			return o
+		}
+	}
+	return ""
+}
+
