@@ -11,6 +11,7 @@
   <a href="https://pkg.go.dev/github.com/jhuggett/mkm"><img src="https://img.shields.io/badge/go-reference-007d9c?style=flat-square&logo=go" alt="go reference" /></a>
   <img src="https://img.shields.io/github/go-mod/go-version/jhuggett/mkm?style=flat-square&color=5e81ac" alt="go version" />
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-d08770?style=flat-square" alt="platform" />
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-a3be8c?style=flat-square" alt="license" /></a>
 </p>
 
 <p align="center">
@@ -251,3 +252,7 @@ Edit live with `^s`. The theme repaints as you cycle; `enter` persists, `esc` re
 ## Releasing
 
 `make release-patch` / `release-minor` / `release-major` reads the latest `v*` git tag, computes the next semver, tags `HEAD`, and pushes the tag. The update banner inside mkm picks it up within a day for everyone running an older release.
+
+## License
+
+[MIT](LICENSE) — Joel Huggett.
