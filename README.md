@@ -13,13 +13,13 @@
   <img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-d08770?style=flat-square" alt="platform" />
 </p>
 
-<!--
-Drop a demo GIF or screenshot here, e.g.
-
 <p align="center">
   <img src="docs/demo.gif" alt="mkm in action" width="780" />
 </p>
--->
+
+<p align="center">
+  <sub>Recordings are generated from <a href="docs/">VHS tapes</a> in this repo — <code>make demo-all</code> to refresh them.</sub>
+</p>
 
 ---
 
@@ -61,6 +61,10 @@ $ mkm --last        # skip the picker, rerun the most recent target
 
 Matches on target name with a fall-through to the description, so a target named `bpdi` whose comment says *"build prod docker image"* shows up when you type `docker`. Recently-run targets are boosted; never-run targets keep the default weight so they don't disappear.
 
+<p align="center">
+  <img src="docs/demo-filter.gif" alt="fuzzy filter demo" width="900" />
+</p>
+
 #### Typed parameter forms
 
 Annotate variables with `@param` comments and mkm turns them into a real form:
@@ -76,17 +80,33 @@ deploy:
 
 Selecting `deploy` opens a form for `ENV`, `VERSION`, and `DRY_RUN`. Required fields are enforced. Enums let you tab through options or type-ahead by letter. The composed `make deploy ENV=prod VERSION=v1.2.3 DRY_RUN=false` is shown live above the keymap. Full spec in [PARAMS.md](PARAMS.md).
 
+<p align="center">
+  <img src="docs/demo-form.gif" alt="parameter form demo" width="900" />
+</p>
+
 #### Scaffold annotations from existing recipes
 
 Pressing `^a` on a target scans its recipe for `$(VAR)` references, drops them into a form, and writes a well-formed `@param` block back into your Makefile. A GitHub-style diff preview shows exactly what will change before you commit.
+
+<p align="center">
+  <img src="docs/demo-scaffold.gif" alt="scaffold demo" width="1000" />
+</p>
 
 #### In-TUI Makefile viewer
 
 `^v` opens the source for the current target inline, with light syntax styling. `n` / `N` jump between target definitions. `e` opens `$EDITOR` at the current line.
 
+<p align="center">
+  <img src="docs/demo-viewer.gif" alt="in-TUI viewer demo" width="1000" />
+</p>
+
 #### Ten themes, live preview
 
 `^s` opens settings. Cycling the theme repaints the whole UI as you scroll, so you can compare before saving. A color swatch under the picker shows the palette at a glance.
+
+<p align="center">
+  <img src="docs/demo-themes.gif" alt="theme cycling demo" width="900" />
+</p>
 
 <details>
 <summary>Theme list</summary>

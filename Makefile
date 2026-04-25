@@ -66,6 +66,52 @@ release-major:
 tar: build
 	tar -czvf mkm.tar.gz mkm;
 
+# Internal: error out (or auto-install) when vhs isn't on PATH.
+# Shared by every demo target so they all behave the same.
+# @param {bool} [INSTALL_VHS=false]  also `go install` VHS if not on PATH
+.PHONY: _demo-vhs-check
+_demo-vhs-check:
+	@if ! command -v vhs >/dev/null 2>&1; then \
+		if [ "$(INSTALL_VHS)" = "true" ]; then \
+			go install github.com/charmbracelet/vhs@latest; \
+		else \
+			echo "vhs not found. Install with 'brew install vhs' or 'make demo INSTALL_VHS=true'."; \
+			exit 1; \
+		fi; \
+	fi
+
+# Record the README hero GIF via VHS. Builds a fresh binary first so the
+# recording uses the latest UI changes. Output lands at docs/demo.gif.
+.PHONY: demo
+demo: build _demo-vhs-check
+	vhs docs/demo.tape
+
+# Per-feature vertical slices, each ~6–10 seconds. Wire individual GIFs
+# into the matching feature subsection in README.md.
+.PHONY: demo-filter
+demo-filter: build _demo-vhs-check
+	vhs docs/demo-filter.tape
+
+.PHONY: demo-form
+demo-form: build _demo-vhs-check
+	vhs docs/demo-form.tape
+
+.PHONY: demo-scaffold
+demo-scaffold: build _demo-vhs-check
+	vhs docs/demo-scaffold.tape
+
+.PHONY: demo-viewer
+demo-viewer: build _demo-vhs-check
+	vhs docs/demo-viewer.tape
+
+.PHONY: demo-themes
+demo-themes: build _demo-vhs-check
+	vhs docs/demo-themes.tape
+
+# Record everything — hero + all five vertical slices. Slow.
+.PHONY: demo-all
+demo-all: demo demo-filter demo-form demo-scaffold demo-viewer demo-themes
+
 # This is a deliberately long description intended to stress-test how the preview pane wraps and clips text when a user hovers over a target whose metadata would otherwise spill beyond the visible width of the right-hand panel; if rendering is correct, it should word-wrap inside the preview and never bleed into the list on the left or past the panel border.
 .PHONY: this-is-an-absurdly-long-target-name-intended-to-stress-test-the-left-pane-truncation-logic
 this-is-an-absurdly-long-target-name-intended-to-stress-test-the-left-pane-truncation-logic: build log-abc log-xyz log-all install tar release-patch release-minor release-major this-is-another-moderately-long-dependency-name another-dep-name-for-good-measure yet-another-dep one-more-for-the-road final-dep
@@ -529,6 +575,12 @@ feature-export: ## Export feature flag config
 	@echo "feature export"
 feature-import: ## Import feature flag config
 	@echo "feature import"
+
+# Demo fixture — intentionally undocumented $(VAR) refs so
+# docs/demo-scaffold.tape can showcase ^a auto-detecting them.
+.PHONY: demo-undoc
+demo-undoc:
+	@echo "deploying $(SERVICE) to $(REGION) replicas=$(REPLICAS)"
 
 # --- fixtures for @param form input ---
 
