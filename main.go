@@ -381,20 +381,22 @@ func runLastTarget(allTargets []MakeTarget, cfg Config, printFlag bool) {
 		fmt.Println(strings.Join(args, " "))
 		return
 	}
-	if cfg.ShellHistory {
-		appendShellHistory(strings.Join(args, " "))
-	}
+	endHist := beginShellHistory(strings.Join(args, " "), cfg.ShellHistory)
 	c := exec.Command(args[0], args[1:]...)
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
-	if err := c.Run(); err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			os.Exit(exitErr.ExitCode())
-		}
+	err := c.Run()
+	if exitErr, ok := err.(*exec.ExitError); ok {
+		endHist(exitErr.ExitCode())
+		os.Exit(exitErr.ExitCode())
+	}
+	if err != nil {
+		endHist(1)
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	endHist(0)
 }
 
 // collectTargets walks the cwd for Makefiles, parses each, and returns the
@@ -533,19 +535,20 @@ func main() {
 
 	// Default: exec the make command directly, wiring std streams so the
 	// user sees output like a normal `make` invocation. Optionally append
-	// the command to $HISTFILE so up-arrow in future shells recalls it.
-	if finalModel.shellHistory {
-		appendShellHistory(strings.Join(args, " "))
-	}
+	// the command to $HISTFILE / atuin so up-arrow recalls it later.
+	endHist := beginShellHistory(strings.Join(args, " "), finalModel.shellHistory)
 	c := exec.Command(args[0], args[1:]...)
 	c.Stdin = os.Stdin
 	c.Stdout = os.Stdout
 	c.Stderr = os.Stderr
 	if err := c.Run(); err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
+			endHist(exitErr.ExitCode())
 			os.Exit(exitErr.ExitCode())
 		}
+		endHist(1)
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+	endHist(0)
 }

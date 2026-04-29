@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -22,6 +23,9 @@ import (
 // the shell wrapper via the settings screen (ctrl+s → shell_history row →
 // ctrl+a). The wrapper runs mkm in --print mode and uses `print -s` /
 // `history -s` to push the entry into the live shell.
+//
+// atuin replaces $HISTFILE with its own SQLite DB and ignores file
+// appends, so it's recorded separately via beginShellHistory.
 func appendShellHistory(cmd string) {
 	shell := os.Getenv("SHELL")
 	switch {
@@ -31,6 +35,51 @@ func appendShellHistory(cmd string) {
 		writeHistoryEntry(bashHistFile(), cmd+"\n")
 	}
 	// fish and other shells use their own formats/databases — skip.
+}
+
+// beginShellHistory records cmd to all configured history sources and
+// returns a func to be called once the command exits, with its real
+// exit code. Captures both halves of atuin's start/end protocol so the
+// recorded entry has accurate duration + exit status.
+//
+// Returns a no-op when enabled is false, so callers can keep the same
+// shape regardless of the shell_history toggle.
+func beginShellHistory(cmd string, enabled bool) func(exitCode int) {
+	if !enabled {
+		return func(int) {}
+	}
+	appendShellHistory(cmd)
+	id, ok := atuinStart(cmd)
+	if !ok {
+		return func(int) {}
+	}
+	return func(exitCode int) { atuinEnd(id, exitCode) }
+}
+
+// atuinStart calls `atuin history start` and returns the entry id atuin
+// emits to stdout, or ("", false) when atuin isn't installed or the call
+// fails. Best-effort — silent failure means we just skip atuin recording.
+func atuinStart(cmd string) (string, bool) {
+	if !hasExecutable("atuin") {
+		return "", false
+	}
+	out, err := exec.Command("atuin", "history", "start", "--", cmd).Output()
+	if err != nil {
+		return "", false
+	}
+	id := strings.TrimSpace(string(out))
+	if id == "" {
+		return "", false
+	}
+	return id, true
+}
+
+// atuinEnd closes an entry started with atuinStart. Silent on failure.
+func atuinEnd(id string, exitCode int) {
+	if id == "" {
+		return
+	}
+	_ = exec.Command("atuin", "history", "end", "--exit", strconv.Itoa(exitCode), id).Run()
 }
 
 func zshHistFile() string {
@@ -115,13 +164,25 @@ const (
 // `history -s` line is present only when the user wants mkm commands in
 // shell history.
 func zshWrapperBlock(addHistory bool) string {
-	pushLine := ""
+	commentSuffix := ""
+	body := "    eval \"$cmd\"\n"
 	if addHistory {
-		pushLine = "    print -s \"$cmd\"\n"
-	}
-	commentSuffix := " (history push disabled via shell_history setting)"
-	if addHistory {
-		commentSuffix = ""
+		// atuin owns its own SQLite DB and doesn't watch $HISTFILE or
+		// `print -s`, so when it's installed we wrap the eval in
+		// start/end so the entry shows up in atuin search with a real
+		// exit code. Falls back to `print -s` for plain zsh history.
+		body = "    if command -v atuin >/dev/null 2>&1; then\n" +
+			"      local __mkm_id __mkm_rc\n" +
+			"      __mkm_id=$(atuin history start \"$cmd\")\n" +
+			"      eval \"$cmd\"\n" +
+			"      __mkm_rc=$?\n" +
+			"      atuin history end --exit $__mkm_rc \"$__mkm_id\" >/dev/null\n" +
+			"      return $__mkm_rc\n" +
+			"    fi\n" +
+			"    print -s \"$cmd\"\n" +
+			"    eval \"$cmd\"\n"
+	} else {
+		commentSuffix = " (history push disabled via shell_history setting)"
 	}
 	return wrapperBeginMarker + "\n" +
 		"# mkm: shell wrapper — evals the selected command in your current shell" + commentSuffix + "\n" +
@@ -129,21 +190,28 @@ func zshWrapperBlock(addHistory bool) string {
 		"  local cmd\n" +
 		"  cmd=$(command mkm --print)\n" +
 		"  if [ -n \"$cmd\" ]; then\n" +
-		pushLine +
-		"    eval \"$cmd\"\n" +
+		body +
 		"  fi\n" +
 		"}\n" +
 		wrapperEndMarker + "\n"
 }
 
 func bashWrapperBlock(addHistory bool) string {
-	pushLine := ""
+	commentSuffix := ""
+	body := "    eval \"$cmd\"\n"
 	if addHistory {
-		pushLine = "    history -s \"$cmd\"\n"
-	}
-	commentSuffix := " (history push disabled via shell_history setting)"
-	if addHistory {
-		commentSuffix = ""
+		body = "    if command -v atuin >/dev/null 2>&1; then\n" +
+			"      local __mkm_id __mkm_rc\n" +
+			"      __mkm_id=$(atuin history start \"$cmd\")\n" +
+			"      eval \"$cmd\"\n" +
+			"      __mkm_rc=$?\n" +
+			"      atuin history end --exit $__mkm_rc \"$__mkm_id\" >/dev/null\n" +
+			"      return $__mkm_rc\n" +
+			"    fi\n" +
+			"    history -s \"$cmd\"\n" +
+			"    eval \"$cmd\"\n"
+	} else {
+		commentSuffix = " (history push disabled via shell_history setting)"
 	}
 	return wrapperBeginMarker + "\n" +
 		"# mkm: shell wrapper — evals the selected command in your current shell" + commentSuffix + "\n" +
@@ -151,8 +219,7 @@ func bashWrapperBlock(addHistory bool) string {
 		"  local cmd\n" +
 		"  cmd=$(command mkm --print)\n" +
 		"  if [ -n \"$cmd\" ]; then\n" +
-		pushLine +
-		"    eval \"$cmd\"\n" +
+		body +
 		"  fi\n" +
 		"}\n" +
 		wrapperEndMarker + "\n"
